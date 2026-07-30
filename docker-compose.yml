@@ -1,0 +1,46 @@
+services:
+  panel:
+    # Built by .github/workflows/image.yml, never locally. The image carries only
+    # dependencies; upstream source is git-pulled by the entrypoint at start, so
+    # source-only upstream commits need a `restart`, not a `pull`.
+    image: ghcr.io/murasamecyan/grok-register-panel-docker:${IMAGE_TAG:-latest}
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    # Camoufox/Firefox crashes on the default 64 MB /dev/shm.
+    shm_size: 1gb
+    environment:
+      MONITOR_HOST: 0.0.0.0        # container-internal; publish only to 127.0.0.1 below
+      MONITOR_PORT: 8787
+      MONITOR_TOKEN: ${MONITOR_TOKEN:?set MONITOR_TOKEN, e.g. openssl rand -base64 32}
+      PANEL_INCLUDE_TAIL: 0
+      UPSTREAM_REF: ${UPSTREAM_REF:-main}
+      UPSTREAM_AUTO_UPDATE: ${UPSTREAM_AUTO_UPDATE:-1}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      # Create these two files before the first `up`, or Docker will make
+      # directories out of them: see README.md step 1.
+      - ./data/config.json:/app/src/config.json
+      - ./data/proxies.txt:/app/src/proxies.txt
+      # Read-only in the web-panel code path (only the Tk desktop app writes
+      # config.json). Do NOT let anything write these through a single-file
+      # mount: secure_files.atomic_write_text does mkstemp+os.replace and the
+      # rename would fail EXDEV across the mount point.
+      # Credential material, bind-mounted so grok2api / CPA can read it and so
+      # you can back it up without docker cp. Host side must be 0700 uid 10001.
+      - ./data/cpa_auth:/app/src/cpa_auth
+      - ./data/grok2api_auth:/app/src/grok2api_auth
+      - ./data/accounts:/app/src/accounts
+      - ./data/log:/app/src/log
+      # ponytail: .next_action_id.cache at the repo root is deliberately NOT
+      # mounted. It is written with atomic_write_text (mkstemp+os.replace), so a
+      # single-file mount fails EXDEV -- and the caller swallows the error, so it
+      # would silently persist nothing. It survives `restart`, is lost on
+      # recreate, and costs one JS-chunk scan to rebuild. Upgrade path: patch
+      # upstream to honour an env var for the cache path, then mount a dir.
+      - camoufox:/home/app/.cache/camoufox
+
+volumes:
+  camoufox:

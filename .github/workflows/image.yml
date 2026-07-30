@@ -1,0 +1,138 @@
+name: image
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if requirements.txt is unchanged"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 4 * * *"
+  push:
+    paths:
+      - Dockerfile
+      - docker/**
+      - .github/workflows/image.yml
+
+concurrency:
+  group: image
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO_SLUG: lij768423-svg/grok-register-panel
+  UPSTREAM_REF: main
+  # GHCR rejects uppercase paths and this owner has capitals, so the repo name
+  # cannot be used verbatim -- keep this literal and lowercase.
+  IMAGE: ghcr.io/murasamecyan/grok-register-panel-docker
+
+jobs:
+  # Cheap API-only probe: resolve upstream HEAD and hash its requirements.txt,
+  # then compare against the published image's label. Source-only commits need
+  # no image at all -- the entrypoint git-pulls them at container start.
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      rev: ${{ steps.up.outputs.rev }}
+      reqs_sha: ${{ steps.up.outputs.reqs_sha }}
+      needs_build: ${{ steps.decide.outputs.needs_build }}
+    steps:
+      - name: Resolve upstream revision and dependency hash
+        id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rev="$(gh api "repos/$UPSTREAM_REPO_SLUG/commits/$UPSTREAM_REF" --jq .sha)"
+          gh api "repos/$UPSTREAM_REPO_SLUG/contents/requirements.txt?ref=$rev" \
+            --jq .content | base64 -d > reqs.txt
+          reqs_sha="$(sha256sum reqs.txt | cut -d' ' -f1)"
+          echo "rev=$rev"           >> "$GITHUB_OUTPUT"
+          echo "reqs_sha=$reqs_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream $rev / reqs $reqs_sha" >> "$GITHUB_STEP_SUMMARY"
+
+      # imagetools needs a registry login even for public reads on GHCR.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare against published image
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ steps.up.outputs.reqs_sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+            echo "reason: ${{ github.event_name }} (forced)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          have="$(docker buildx imagetools inspect "$IMAGE:latest" --format \
+                    '{{ index .Image.Config.Labels "io.grokpanel.reqs-sha256" }}' \
+                    2>/dev/null || true)"
+          if [ "$have" = "$WANT" ]; then
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            echo "deps unchanged, skipping build (restart your container to get source)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+            echo "deps changed: $have -> $WANT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    needs: probe
+    if: needs.probe.outputs.needs_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=reqs-${{ needs.probe.outputs.reqs_sha }}
+            type=sha,format=long,prefix=upstream-,value=${{ needs.probe.outputs.rev }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # linux/amd64 only: Camoufox ships prebuilt Firefox binaries and an
+          # arm64 build would need QEMU emulation for `camoufox fetch`.
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            UPSTREAM_REF=${{ env.UPSTREAM_REF }}
+            UPSTREAM_REV=${{ needs.probe.outputs.rev }}
+            REQS_SHA256=${{ needs.probe.outputs.reqs_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+
+      - name: Verify the image can start and self-check
+        env:
+          TAG: ${{ env.IMAGE }}:reqs-${{ needs.probe.outputs.reqs_sha }}
+        run: |
+          set -euo pipefail
+          # MONITOR_HOST must be loopback here: the entrypoint refuses a
+          # non-loopback bind without MONITOR_TOKEN, and CI has no token.
+          docker run --rm --shm-size=1g \
+            -e UPSTREAM_AUTO_UPDATE=0 -e MONITOR_HOST=127.0.0.1 \
+            "$TAG" smoke.sh

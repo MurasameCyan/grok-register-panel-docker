@@ -1,0 +1,5 @@
+# These are executed inside a Linux container. A CRLF checkout makes the shebang
+# `#!/bin/sh\r` and exec fails with "no such file or directory".
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
