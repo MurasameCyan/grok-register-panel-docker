@@ -62,6 +62,9 @@ WORKDIR /app/src
 # Bundled Camoufox browser (~150 MB) into the app user's cache dir.
 RUN camoufox fetch && camoufox version
 
+# CPA_AUTH_DIR is a path, not a credential; buildkit's SecretsUsedInArgOrEnv
+# rule only pattern-matches the "AUTH" substring.
+# hadolint ignore=SecretsUsedInArgOrEnv
 ENV MONITOR_HOST=0.0.0.0 \
     MONITOR_PORT=8787 \
     PANEL_INCLUDE_TAIL=0 \

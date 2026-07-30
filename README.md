@@ -148,8 +148,13 @@ Camoufox 浏览器已下载、`xvfb-run` 和 `/proc` 可用(`process_utils.py` �
 触发:每天 04:17 UTC 定时、改 `Dockerfile`/`docker/**` 时 push、手动 dispatch。
 仅 `linux/amd64` —— Camoufox 发的是预编译 Firefox,arm64 要 QEMU 模拟 `camoufox fetch`。
 
-首次跑完后去仓库 Packages 页面把 package 设为 public,否则宿主 `pull` 前要先
-`docker login ghcr.io`。
+**GHCR package 默认是 private。** 第一次构建完要手动改一次:
+https://github.com/users/MurasameCyan/packages/container/grok-register-panel-docker/settings
+→ Change visibility → Public。不改也能用,但宿主 `pull` 前得先:
+
+```bash
+echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
+```
 
 ## 5. 设计取舍
 
