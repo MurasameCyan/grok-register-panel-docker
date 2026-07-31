@@ -164,7 +164,11 @@ Camoufox 浏览器已下载、`xvfb-run` 和 `/proc` 可用(`process_utils.py` �
   推完 `docker run ... smoke.sh` 自检,起不来就红。
 
 触发:每天 04:17 UTC 定时、改 `Dockerfile`/`docker/**` 时 push、手动 dispatch。
-仅 `linux/amd64` —— Camoufox 发的是预编译 Firefox,arm64 要 QEMU 模拟 `camoufox fetch`。
+
+平台:`linux/amd64` + `linux/arm64`。Camoufox 上游同时发 `lin.x86_64` 和 `lin.arm64`
+的 Firefox 构建,所以两边 `camoufox fetch` 都能拿到原生二进制,**运行时不需要模拟**。
+arm64 的镜像层是在 amd64 runner 上用 QEMU 构建的(只影响构建耗时,约 20~30 分钟)。
+`docker compose pull` 会按宿主架构自动选,不用指定。
 
 **GHCR package 默认是 private。** 第一次构建完要手动改一次:
 https://github.com/users/MurasameCyan/packages/container/grok-register-panel-docker/settings
@@ -185,6 +189,7 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 | `shm_size: 1gb` | Firefox/Camoufox 在默认 64 MB `/dev/shm` 上会崩 |
 | 容器内 `MONITOR_HOST=0.0.0.0`,端口只发布到 `127.0.0.1` | 容器网络里绑 loopback 就没法从宿主访问;隔离交给端口发布,不是绑定地址 |
 | 镜像内装 xvfb + procps | 注册流程走 `xvfb-run`,面板停止进程要读 `/proc` 和 `ps` |
+| 同时出 amd64 和 arm64 | Camoufox 两个架构都有原生 Firefox 构建,ARM 云主机(Ampere、Graviton)能原生跑,不必 QEMU |
 | 授权目录 bind mount,只有 camoufox 缓存用命名卷 | 授权文件是这个面板的产出,要能被 grok2api 读、能直接备份;camoufox 是可重下的缓存,不需要在宿主可见 |
 | 非 root 运行(uid 10001) | 面板会 spawn 子进程、写凭据文件,不该有 root |
 

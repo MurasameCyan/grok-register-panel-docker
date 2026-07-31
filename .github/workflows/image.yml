@@ -93,6 +93,11 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      # arm64 layers are built under emulation on the amd64 runner. Only the
+      # image build needs this; the container runs natively on real hardware.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -113,9 +118,9 @@ jobs:
         with:
           context: .
           push: true
-          # linux/amd64 only: Camoufox ships prebuilt Firefox binaries and an
-          # arm64 build would need QEMU emulation for `camoufox fetch`.
-          platforms: linux/amd64
+          # Both arches: Camoufox publishes lin.arm64 and lin.x86_64 Firefox
+          # builds, so `camoufox fetch` resolves natively on each platform.
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -126,13 +131,23 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: true
 
-      - name: Verify the image can start and self-check
+      - name: Verify both arches are published and can self-check
         env:
           TAG: ${{ env.IMAGE }}:reqs-${{ needs.probe.outputs.reqs_sha }}
         run: |
           set -euo pipefail
+          got="$(docker buildx imagetools inspect "$TAG" --format \
+                   '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')"
+          echo "published platforms: $got"
+          for want in linux/amd64 linux/arm64; do
+            case "$got" in *"$want"*) ;; *) echo "missing $want" >&2; exit 1 ;; esac
+          done
           # MONITOR_HOST must be loopback here: the entrypoint refuses a
           # non-loopback bind without MONITOR_TOKEN, and CI has no token.
-          docker run --rm --shm-size=1g \
-            -e UPSTREAM_AUTO_UPDATE=0 -e MONITOR_HOST=127.0.0.1 \
-            "$TAG" smoke.sh
+          # arm64 runs under QEMU, so it is slow but exercises the same paths.
+          for plat in linux/amd64 linux/arm64; do
+            echo "--- smoke $plat ---"
+            docker run --rm --platform "$plat" --shm-size=1g \
+              -e UPSTREAM_AUTO_UPDATE=0 -e MONITOR_HOST=127.0.0.1 \
+              "$TAG" smoke.sh
+          done
