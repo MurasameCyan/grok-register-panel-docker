@@ -22,12 +22,16 @@ chmod 600 data/config.json data/proxies.txt
 chmod 700 data/cpa_auth data/grok2api_auth data/accounts data/log
 sudo chown -R 10001:10001 data          # 容器内是 uid 10001
 
-cp .env.example .env
-sed -i "s|^MONITOR_TOKEN=.*|MONITOR_TOKEN=$(openssl rand -base64 32)|" .env
+# hex 而非 base64:base64 会产生 + / = ,compose 解析 .env 时容易出岔
+printf 'MONITOR_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
 chmod 600 .env
 
-docker compose up -d          # 直接拉 GHCR 镜像,不构建
+docker compose up -d --pull always      # 直接拉 GHCR 镜像,不构建
 ```
+
+没有 `.env` 就 `up` 会直接报
+`required variable MONITOR_TOKEN is missing a value` —— 这是故意的硬失败,不是 bug:
+容器内绑 `0.0.0.0`,没 Token 启动就是个无鉴权面板。
 
 **`.env` 不需要映射进容器。** 它是 docker compose 在**宿主**上读的变量替换文件,compose
 读完把值作为真正的环境变量注入容器。上游没有任何 dotenv 依赖 —— `monitor.py`、
@@ -122,9 +126,23 @@ UPSTREAM_AUTO_UPDATE=0 docker compose up -d    # 冻结在镜像构建时的快�
 注意 `UPSTREAM_REF` 用 `ls-remote refs/heads/<ref>` 查,所以钉 tag 时它查不到远端 ref,
 会走"unreachable, running pinned"分支 —— 效果是不更新,符合预期,但日志有点误导。
 
-## 3. 验证
+## 3. 从远程访问面板
+
+端口只发布到宿主 `127.0.0.1:8787`,云主机上不能直接从外网打开。用 SSH 隧道:
 
 ```bash
+# 在你本地机器上执行
+ssh -N -L 8787:127.0.0.1:8787 root@<服务器IP>
+# 本地浏览器开 http://127.0.0.1:8787,"访问令牌"填 .env 里的 MONITOR_TOKEN
+```
+
+不要为了图方便把映射改成 `"8787:8787"` —— 那等于把内置 HTTP 服务裸放公网,上游明确说它
+不替代互联网边界网关。要公网访问就放到带 TLS 和额外身份认证的反代后面。
+
+## 4. 验证
+
+```bash
+docker compose logs --tail=30 panel     # 看 [upstream] 和 [deps] 两行
 docker compose exec panel smoke.sh
 curl -fsS http://127.0.0.1:8787/api/health
 curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/status          # 期望 401
@@ -136,7 +154,7 @@ curl -H "Authorization: Bearer $MONITOR_TOKEN" http://127.0.0.1:8787/api/status 
 Camoufox 浏览器已下载、`xvfb-run` 和 `/proc` 可用(`process_utils.py` 靠 `/proc` 找进程),
 再做一次真实的 `git reset --hard` 确认 `log/` 下的运行数据没被冲掉。
 
-## 4. CI
+## 5. CI
 
 `.github/workflows/image.yml`,两个 job:
 
@@ -156,7 +174,7 @@ https://github.com/users/MurasameCyan/packages/container/grok-register-panel-doc
 echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 ```
 
-## 5. 设计取舍
+## 6. 设计取舍
 
 | 决定 | 原因 |
 | --- | --- |
@@ -170,7 +188,7 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 | 授权目录 bind mount,只有 camoufox 缓存用命名卷 | 授权文件是这个面板的产出,要能被 grok2api 读、能直接备份;camoufox 是可重下的缓存,不需要在宿主可见 |
 | 非 root 运行(uid 10001) | 面板会 spawn 子进程、写凭据文件,不该有 root |
 
-## 6. 安全边界
+## 7. 安全边界
 
 内置 HTTP 服务只适合单机 / LAN / tailnet。上面的 compose 只把端口发布到宿主
 `127.0.0.1`,不是公网可达。要对外暴露,放到带 TLS 和额外身份认证的反向代理后面,

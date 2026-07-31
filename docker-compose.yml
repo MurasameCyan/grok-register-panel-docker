@@ -12,7 +12,9 @@ services:
     environment:
       MONITOR_HOST: 0.0.0.0        # container-internal; publish only to 127.0.0.1 below
       MONITOR_PORT: 8787
-      MONITOR_TOKEN: ${MONITOR_TOKEN:?set MONITOR_TOKEN, e.g. openssl rand -base64 32}
+      # Hard-fail rather than start an unauthenticated panel on 0.0.0.0.
+      # To fix: printf 'MONITOR_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
+      MONITOR_TOKEN: "${MONITOR_TOKEN:?no .env beside docker-compose.yml - see README step 1}"
       PANEL_INCLUDE_TAIL: 0
       UPSTREAM_REF: ${UPSTREAM_REF:-main}
       UPSTREAM_AUTO_UPDATE: ${UPSTREAM_AUTO_UPDATE:-1}
