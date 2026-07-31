@@ -54,7 +54,19 @@ if [ "$want" != "$have" ]; then
 fi
 
 mkdir -p log accounts cpa_auth grok2api_auth
-[ -f config.json ] || { [ -f config.example.json ] && cp config.example.json config.json; }
+
+# Docker silently creates a DIRECTORY for a single-file bind mount whose host
+# path does not exist yet. Fail loudly instead of looping on a doomed `cp`.
+for f in config.json proxies.txt; do
+    [ -d "$f" ] || continue
+    echo "$APP_DIR/$f is a directory, not a file. The host path did not exist" >&2
+    echo "when the container first started, so Docker created a directory." >&2
+    echo "Fix on the host: docker compose down && rmdir data/$f" >&2
+    echo "then create it as a real file before the next up. See README step 1." >&2
+    exit 1
+done
+
+[ -f config.json ] || cp config.example.json config.json
 
 # Bind-mounted dirs keep host ownership. Fail now rather than after a register
 # run has already spent an email address and cannot write the auth file.

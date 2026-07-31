@@ -17,6 +17,9 @@ command -v xvfb-run >/dev/null || fail "xvfb-run missing (run_batch_headless wou
 for d in log accounts cpa_auth grok2api_auth; do
     [ -w "$d" ] || fail "$d not writable (auth files would be lost after a register run)"
 done
+for f in config.json proxies.txt; do
+    [ -f "$f" ] || fail "$f is not a regular file (Docker makes a dir from a missing host path)"
+done
 
 git rev-parse HEAD >/dev/null 2>&1 || fail "not a git checkout (upstream sync impossible)"
 

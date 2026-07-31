@@ -81,5 +81,8 @@ LABEL org.opencontainers.image.source="https://github.com/lij768423-svg/grok-reg
       io.grokpanel.upstream-rev="${UPSTREAM_REV}" \
       io.grokpanel.reqs-sha256="${REQS_SHA256}"
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+# -s: compose sets `init: true`, so Docker's own init owns PID 1 and tini runs
+# as a child. Without -s tini warns it cannot reap, and orphaned xvfb/firefox
+# processes from a killed batch would accumulate as zombies.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["python", "-u", "webui/monitor.py"]
