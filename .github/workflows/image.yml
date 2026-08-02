@@ -195,6 +195,30 @@ jobs:
             || { echo "opt-out failed without naming the unwritable mounts" >&2; exit 1; }
           sudo rm -rf "$host" "$optout"
 
+          # A user who keeps an old docker-compose.yml gets single-file mounts,
+          # which Docker materialises as root-owned dirs when ./data is gone.
+          # Nothing in the container can unmount those, so the only correct
+          # behaviour is to name the stale compose file instead of dying on `ln`.
+          echo "--- a stale single-file mount is diagnosed, not retried ---"
+          legacy="$(mktemp -d)"
+          sudo mkdir -p "$legacy/config.json" "$legacy/proxies.txt"
+          sudo chown -R 0:0 "$legacy"
+          if docker run --rm --shm-size=1g --platform linux/amd64 \
+               -e UPSTREAM_AUTO_UPDATE=0 -e MONITOR_HOST=127.0.0.1 \
+               -v "$legacy/config.json":/app/src/config.json \
+               -v "$legacy/proxies.txt":/app/src/proxies.txt \
+               "$TAG" smoke.sh 2>&1 | tee /tmp/legacy.log; then
+            echo "expected a non-zero exit with legacy single-file mounts" >&2; exit 1
+          fi
+          grep -q 'docker-compose.yml predates this image' /tmp/legacy.log \
+            || { echo "did not identify the stale compose file" >&2; exit 1; }
+          # `if`, not `grep ... && { exit 1; }`: a non-match is the PASS case here,
+          # and as the last element of an && list its exit 1 would trip set -e.
+          if grep -q 'failed to create symbolic link' /tmp/legacy.log; then
+            echo "still dying on ln instead of diagnosing the mount" >&2; exit 1
+          fi
+          sudo rm -rf "$legacy"
+
           # The promise this image makes: pull and `up -d` with nothing prepared
           # on the host -- no mkdir, no chown, no .env, no token.
           echo "--- compose up with nothing prepared ---"

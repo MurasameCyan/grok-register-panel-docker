@@ -12,15 +12,19 @@ CI 也按这个规则判断:定时任务比对上游 `requirements.txt` 的 sha2
 
 ## 1. 首次部署
 
-拿到 `docker-compose.yml` 之后,就这一条:
+一个空目录,取一份 `docker-compose.yml`,起:
 
 ```bash
+curl -fsSLO https://raw.githubusercontent.com/MurasameCyan/grok-register-panel-docker/main/docker-compose.yml
 docker compose up -d
 ```
 
 不用建目录、不用 `chown`、不用写 `.env`、不用先生成 Token。数据存在命名卷里,首次启动时
 entrypoint 会把 `config.json`(从上游 `config.example.json` 拷)、空的 `proxies.txt` 和一个
 随机 Token 都建好。
+
+`docker-compose.yml` 和镜像是配套的,升级时两个都要更新 —— 只 `pull` 镜像、留着旧
+compose 文件会挂在旧的单文件挂载上,见下面"从旧版升级"。
 
 取 Token:
 
@@ -103,22 +107,40 @@ docker compose exec -T panel tar cf - panel-data cpa_auth grok2api_auth accounts
 写,Web 面板只读;真要通过面板写它,因为现在是目录挂载,`secure_files.atomic_write_text`
 的 mkstemp + `os.replace` 也不再跨挂载点 EXDEV 失败(临时文件落在同一个目录内)。
 
-> **从旧版升级:**
+> **从旧版升级:`docker-compose.yml` 也要一起换。**
 >
-> 旧版(单文件挂载或 `data/` bind mount)的数据在宿主 `./data/` 里。想继续用宿主目录,
-> 把两个文件挪进 `data/panel/` 后叠加 bind 覆盖文件:
+> 只 `docker compose pull` 是不够的:旧 compose 把 `config.json`、`proxies.txt` 当**单文件**
+> 挂载,而 Docker 在宿主路径不存在时会把挂载源建成**目录**。所以删掉 `data/` 再拉新镜像会
+> 撞上这个,而且容器内无法自救(`umount` 需要 `CAP_SYS_ADMIN`):
+>
+> ```
+> ln: failed to create symbolic link 'config.json/config.json': Permission denied
+> ```
+>
+> 新镜像遇到这个形状会直接报"你的 docker-compose.yml 版本过旧"并退出,不再在 `ln` 上打转。
+> 修法是把 compose 文件也更新:
 >
 > ```bash
 > docker compose down
-> mkdir -p data/panel && mv data/config.json data/proxies.txt data/panel/  # 若还是旧布局
-> docker compose pull
+> curl -fsSLO https://raw.githubusercontent.com/MurasameCyan/grok-register-panel-docker/main/docker-compose.yml
+> docker compose up -d
+> ```
+>
+> 数据在 `./data/` 里、想继续留在宿主上,则再取一份 bind 覆盖文件,并把两个文件挪进
+> `data/panel/`:
+>
+> ```bash
+> docker compose down
+> curl -fsSLO https://raw.githubusercontent.com/MurasameCyan/grok-register-panel-docker/main/docker-compose.yml
+> curl -fsSLO https://raw.githubusercontent.com/MurasameCyan/grok-register-panel-docker/main/docker-compose.bind.yml
+> mkdir -p data/panel && mv data/config.json data/proxies.txt data/panel/   # 若还是旧布局
 > docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d
 > ```
 >
 > 不用手工 `chown`:entrypoint 会把 `data/` 下这几个目录的属主一并修好,包括旧部署里
-> 被 Docker 建成 `root:root` 的那些。`pull` 别省 —— 自动修属主是新镜像才有的。
+> 被 Docker 建成 `root:root` 的那些。
 >
-> 想改用命名卷(默认),把 `data/` 里的内容拷进去:
+> 想改用命名卷(默认),先按上面第一段换掉 compose 文件,再把 `data/` 里的内容拷进去:
 >
 > ```bash
 > docker compose up -d      # 先让卷建出来
@@ -178,6 +200,14 @@ docker/check-update.sh
 它查 GitHub API 比对 commit hash,再看两个 revision 之间 `requirements.txt` 有没有动 ——
 源码变动不需要新镜像(启动时 git pull 就够),只有依赖变动才要拉镜像。退出码可以直接用在
 cron 里。
+
+`docker compose pull` 时顺手把 compose 文件也拉一次,它和镜像是配套的(挂载布局变过一次,
+只换镜像会起不来):
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/MurasameCyan/grok-register-panel-docker/main/docker-compose.yml
+docker compose pull && docker compose up -d
+```
 
 依赖变动时 CI 会在几小时内(定时 04:17 UTC)自动出新镜像;想立刻要,去 Actions 手动跑
 `image` workflow(`workflow_dispatch`,勾 force)。等不及也可以先 `restart` —— entrypoint
@@ -248,11 +278,13 @@ Camoufox 浏览器已下载、`xvfb-run` 和 `/proc` 可用(`process_utils.py` �
 - **probe** — 只用 GitHub API:解析上游 HEAD、取 `requirements.txt` 的 sha256,和已发布镜像
   的 `io.grokpanel.reqs-sha256` label 比。定时触发且依赖没变 → 不构建。
 - **build** — buildx 推 GHCR,三个 tag:`latest`、`reqs-<sha256>`、`upstream-<rev>`;
-  推完跑四组自检,任一失败就红:
+  推完跑五组自检,任一失败就红:
   - `docker run ... smoke.sh`,两个架构各一遍。
   - 挂一组 `root:root` 的宿主目录进去,验证 entrypoint 能自动修属主、`config.json` 真的
     落在挂载的宿主侧。
   - `PANEL_FIX_OWNERSHIP=0` 再跑一次,确认退出码非 0 且报错点出了不可写的挂载。
+  - 按旧 compose 的样子挂两个单文件进去(宿主侧是 `root:root` 目录),确认容器**指出
+    compose 文件过旧**而不是死在 `ln: failed to create symbolic link` 上。
   - **在空临时目录里只放一份 `docker-compose.yml` 就 `up -d --wait`** —— 没有 `.env`、
     没有 `data/`、没有预建卷,复刻用户拉取即用的路径。等 HEALTHCHECK 转绿后校验生成的
     Token 是 64 位 hex、`/api/status` 不带 Token 401 带 Token 200,再 `down`/`up` 一次
@@ -290,6 +322,7 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 | `config.json`/`proxies.txt` 挂目录 `panel-data/` 再软链,不直接挂单文件 | 缺失的宿主单文件会被 Docker 建成目录,首次 `up` 就崩;挂目录则由 entrypoint 兜底创建两个文件并软链进 `src/`,新部署无需手动 `touch`/`cp` |
 | 非 root 运行(uid 10001) | 面板会 spawn 子进程、写凭据文件,不该有 root |
 | entrypoint 以 root 起,chown 完挂载后 gosu 降权 | Docker 把缺失的挂载源建成 `root:root`,靠文档要求用户先 chown 是行不通的(删掉 `data/` 重来就会复现);容器自己修,面板进程仍是 uid 10001 |
+| 启动时先检测"旧 compose 的单文件挂载",命中就退出并指名 | 这是唯一容器内修不了的失败:`umount` 要 `CAP_SYS_ADMIN`。不检测的话症状是 `ln: failed to create symbolic link 'config.json/config.json'`,指向 `ln` 而不是指向真正要动的那个文件,用户会以为是镜像的 bug |
 
 ## 7. 安全边界
 

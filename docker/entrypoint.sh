@@ -10,6 +10,44 @@ PANEL_GID="${PANEL_GID:-10001}"
 DATA_DIR="${PANEL_DATA_DIR:-$APP_DIR/panel-data}"
 cd "$APP_DIR"
 
+# A stale docker-compose.yml is the one failure this image cannot repair from
+# inside: single-file mounts like ./data/config.json:/app/src/config.json turn
+# into DIRECTORIES when the host path is missing, and unmounting needs
+# CAP_SYS_ADMIN we do not have. Detect it first, before the git sync buries the
+# cause under an `ln: failed to create symbolic link 'config.json/config.json'`
+# that names the symptom and not the fix.
+stale=''
+for f in config.json proxies.txt; do
+    # Two shapes of the same stale mount. Missing host path: Docker creates the
+    # source as a root-owned DIRECTORY, and `ln -sfn` cheerfully links into it
+    # ("config.json/config.json"). Existing host file: it mounts as a file, but
+    # then `ln -sfn` cannot replace a mount point (EBUSY). mountinfo catches
+    # both; -d alone is the fallback if /proc is somehow unreadable.
+    if [ -d "$f" ]; then
+        stale="$stale  $APP_DIR/$f is a directory, not a file
+"
+    elif awk -v t="$APP_DIR/$f" '$5 == t { hit = 1 } END { exit !hit }' \
+              /proc/self/mountinfo 2>/dev/null; then
+        stale="$stale  $APP_DIR/$f is mounted as a single file
+"
+    fi
+done
+if [ -n "$stale" ]; then
+    echo "Your docker-compose.yml predates this image:" >&2
+    printf '%s' "$stale" >&2
+    echo "It mounts those two as single files. Current compose mounts one" >&2
+    echo "directory (panel-data/) and symlinks them, because a single-file mount" >&2
+    echo "becomes a directory when its host path is missing -- and no capability" >&2
+    echo "this container has can undo a mount. Refresh the compose file:" >&2
+    echo "  docker compose down" >&2
+    echo "  curl -fsSLO https://raw.githubusercontent.com/MurasameCyan/grok-register-panel-docker/main/docker-compose.yml" >&2
+    echo "  docker compose up -d" >&2
+    echo "To keep data on the host instead of in named volumes, also fetch" >&2
+    echo "docker-compose.bind.yml, move data/config.json and data/proxies.txt into" >&2
+    echo "data/panel/, and add -f docker-compose.bind.yml to both commands." >&2
+    exit 1
+fi
+
 # Docker creates a bind mount's host directory as root:root when it does not
 # exist yet, so a first `up` hands the container four or five unwritable mounts
 # no matter what the docs say to chown beforehand. Fix it here instead of
