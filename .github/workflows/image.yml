@@ -142,8 +142,6 @@ jobs:
           for want in linux/amd64 linux/arm64; do
             case "$got" in *"$want"*) ;; *) echo "missing $want" >&2; exit 1 ;; esac
           done
-          # MONITOR_HOST must be loopback here: the entrypoint refuses a
-          # non-loopback bind without MONITOR_TOKEN, and CI has no token.
           # arm64 runs under QEMU, so it is slow but exercises the same paths.
           for plat in linux/amd64 linux/arm64; do
             echo "--- smoke $plat ---"
@@ -187,3 +185,45 @@ jobs:
           grep -q 'not writable by uid' /tmp/optout.log \
             || { echo "opt-out failed without naming the unwritable mounts" >&2; exit 1; }
           sudo rm -rf "$host"
+
+          # The promise this image makes: pull and `up -d` with nothing prepared
+          # on the host -- no mkdir, no chown, no .env, no token.
+          echo "--- compose up with nothing prepared ---"
+          fresh="$(mktemp -d)"
+          cp docker-compose.yml "$fresh/"
+          cd "$fresh"
+          IMAGE_TAG="reqs-${{ needs.probe.outputs.reqs_sha }}" \
+            docker compose up -d --wait --wait-timeout 180
+          # --wait gates on the HEALTHCHECK, so reaching here means the panel is
+          # actually serving /api/health, not merely that the process started.
+          test -z "$(docker compose ps --status exited -q)" \
+            || { docker compose logs; echo "a container exited" >&2; exit 1; }
+
+          token="$(docker compose exec -T panel cat panel-data/monitor_token | tr -d '\r\n')"
+          printf '%s' "$token" | grep -Eq '^[0-9a-f]{64}$' \
+            || { docker compose logs; echo "not a 64-hex token: '$token'" >&2; exit 1; }
+          echo "generated a 64-hex token (${#token} chars)"
+
+          # Unauthenticated must be refused, and the generated token accepted --
+          # otherwise "no .env needed" would mean "no auth needed".
+          code="$(docker compose exec -T panel curl -so /dev/null -w '%{http_code}' \
+                    http://127.0.0.1:8787/api/status)"
+          [ "$code" = 401 ] || { echo "unauthenticated /api/status gave $code, want 401" >&2; exit 1; }
+          code="$(docker compose exec -T panel curl -so /dev/null -w '%{http_code}' \
+                    -H "Authorization: Bearer $token" http://127.0.0.1:8787/api/status)"
+          [ "$code" = 200 ] || { echo "token-authenticated /api/status gave $code, want 200" >&2; exit 1; }
+          echo "401 without the token, 200 with it"
+
+          # The token must survive a recreate, or every `pull` would lock the
+          # user out of their own panel.
+          docker compose down
+          IMAGE_TAG="reqs-${{ needs.probe.outputs.reqs_sha }}" \
+            docker compose up -d --wait --wait-timeout 180
+          again="$(docker compose exec -T panel cat panel-data/monitor_token)"
+          [ "$again" = "$token" ] \
+            || { echo "token changed across recreate: $token -> $again" >&2; exit 1; }
+          echo "token survived down/up"
+
+          docker compose down -v
+          cd - >/dev/null
+          rm -rf "$fresh"

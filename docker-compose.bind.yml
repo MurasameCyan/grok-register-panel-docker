@@ -1,0 +1,20 @@
+# Overlay: swap the named volumes for ./data bind mounts, for when you want the
+# auth files and logs directly visible on the host -- to hand grok2api_auth to
+# another container, or to back it up with tar instead of `docker run --rm -v`.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d
+#
+# You still do not need to mkdir or chown anything: Docker creates the missing
+# ./data/* dirs as root:root and the entrypoint chowns them to 10001:10001
+# before dropping privileges. Set PANEL_FIX_OWNERSHIP=0 to manage that yourself.
+services:
+  panel:
+    volumes:
+      - ./data/panel:/app/src/panel-data
+      - ./data/cpa_auth:/app/src/cpa_auth
+      - ./data/grok2api_auth:/app/src/grok2api_auth
+      - ./data/accounts:/app/src/accounts
+      - ./data/log:/app/src/log
+      # Not listed above, so compose would drop it: volume lists are replaced
+      # wholesale by an overlay, not merged per entry.
+      - camoufox:/home/app/.cache/camoufox

@@ -12,9 +12,9 @@ services:
     environment:
       MONITOR_HOST: 0.0.0.0        # container-internal; publish only to 127.0.0.1 below
       MONITOR_PORT: 8787
-      # Hard-fail rather than start an unauthenticated panel on 0.0.0.0.
-      # To fix: printf 'MONITOR_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
-      MONITOR_TOKEN: "${MONITOR_TOKEN:?no .env beside docker-compose.yml - see README step 1}"
+      # Optional: unset means the entrypoint generates one on first start and
+      # saves it to panel-data/monitor_token. Set it in .env to pin your own.
+      MONITOR_TOKEN: ${MONITOR_TOKEN:-}
       PANEL_INCLUDE_TAIL: 0
       UPSTREAM_REF: ${UPSTREAM_REF:-main}
       UPSTREAM_AUTO_UPDATE: ${UPSTREAM_AUTO_UPDATE:-1}
@@ -22,17 +22,25 @@ services:
     ports:
       - "127.0.0.1:8787:8787"
     volumes:
-      # config.json + proxies.txt live in this ONE directory; the entrypoint
-      # creates them on first start (from config.example.json / empty) and
-      # symlinks them into /app/src, so a fresh `up` needs no manual touch/cp
-      # and Docker can't turn a missing single file into a directory.
-      - ./data/panel:/app/src/panel-data
-      # Credential material, bind-mounted so grok2api / CPA can read it and so
-      # you can back it up without docker cp. Host side must be 0700 uid 10001.
-      - ./data/cpa_auth:/app/src/cpa_auth
-      - ./data/grok2api_auth:/app/src/grok2api_auth
-      - ./data/accounts:/app/src/accounts
-      - ./data/log:/app/src/log
+      # Named volumes, not bind mounts, so `docker compose up -d` works with
+      # nothing prepared on the host. Docker seeds a new named volume from the
+      # image, inheriting uid 10001 from /app -- whereas it creates a missing
+      # bind-mount source as root:root, which is what used to trap a fresh `up`
+      # in a "not writable by uid 10001" restart loop.
+      #
+      # To put any of these somewhere you can browse or back up directly, see
+      # docker-compose.bind.yml: `docker compose -f docker-compose.yml -f
+      # docker-compose.bind.yml up -d`.
+      #
+      # panel-data holds config.json + proxies.txt (created here on first start
+      # and symlinked into /app/src) plus the generated monitor_token.
+      - panel-data:/app/src/panel-data
+      # Credential material: the panel's own output, kept out of the container
+      # layer so it survives recreate.
+      - cpa_auth:/app/src/cpa_auth
+      - grok2api_auth:/app/src/grok2api_auth
+      - accounts:/app/src/accounts
+      - log:/app/src/log
       # ponytail: .next_action_id.cache at the repo root is deliberately NOT
       # mounted. It is written with atomic_write_text (mkstemp+os.replace), so a
       # single-file mount fails EXDEV -- and the caller swallows the error, so it
@@ -42,4 +50,9 @@ services:
       - camoufox:/home/app/.cache/camoufox
 
 volumes:
+  panel-data:
+  cpa_auth:
+  grok2api_auth:
+  accounts:
+  log:
   camoufox:

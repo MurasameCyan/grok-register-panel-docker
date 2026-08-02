@@ -12,82 +12,132 @@ CI 也按这个规则判断:定时任务比对上游 `requirements.txt` 的 sha2
 
 ## 1. 首次部署
 
-```bash
-# hex 而非 base64:base64 会产生 + / = ,compose 解析 .env 时容易出岔
-printf 'MONITOR_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
-chmod 600 .env
+拿到 `docker-compose.yml` 之后,就这一条:
 
-docker compose up -d --pull always      # 直接拉 GHCR 镜像,不构建
+```bash
+docker compose up -d
 ```
 
-`data/` 下的目录不用先建、也不用 `chown`。Docker 会把缺失的挂载源建成 `root:root`,
-entrypoint 以 root 启动时把它们 chown 成 `10001:10001`,然后用 gosu 降到 uid 10001 再跑
-面板 —— 面板进程本身不是 root(`docker compose exec panel id` 可验证)。
+不用建目录、不用 `chown`、不用写 `.env`、不用先生成 Token。数据存在命名卷里,首次启动时
+entrypoint 会把 `config.json`(从上游 `config.example.json` 拷)、空的 `proxies.txt` 和一个
+随机 Token 都建好。
 
-> 早期版本要求手工 `mkdir` + `chown` 在 `up` 之前完成,漏了就会陷入
-> `not writable by uid 10001` 的重启循环。现在容器自己处理,那一步已经不需要了。
-
-要自己管属主(比如宿主用了别的 uid、或不接受容器短暂持有 root):
+取 Token:
 
 ```bash
-# 二选一,两种都会跳过自动 chown,并在属主不对时直接报错退出
+docker compose exec panel cat panel-data/monitor_token
+# 或从日志里看,首次启动会打印一次
+docker compose logs panel | grep '\[token\]'
+```
+
+浏览器开 `http://127.0.0.1:8787`,在"访问令牌"填进去。
+
+想用自己的 Token 就写 `.env`,entrypoint 不会覆盖它:
+
+```bash
+printf 'MONITOR_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env    # hex,不是 base64
+chmod 600 .env
+docker compose up -d
+```
+
+> **`.env` 不需要映射进容器。** 它是 docker compose 在**宿主**上读的变量替换文件,compose
+> 读完把值作为真正的环境变量注入容器。上游没有任何 dotenv 依赖 —— `monitor.py`、
+> `security_utils.py` 全部走 `os.environ.get`,容器里没人会去读 `.env`。挂进去只会多暴露
+> 一份 Token。
+
+起来之后按需编辑配置(邮箱服务商见上游 `DEPLOYMENT.md` 第 2 节),再 `restart`:
+
+```bash
+docker compose exec panel vi panel-data/config.json    # 或在面板里改
+docker compose restart panel
+```
+
+### 想让数据直接落在宿主目录
+
+默认用命名卷是为了"拉了就能跑"。要把授权文件和日志放到宿主上(方便给 grok2api 挂、方便
+`tar` 备份),叠加 `docker-compose.bind.yml`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d
+```
+
+数据落在 `./data/`。同样不需要预先 `mkdir` 或 `chown`:Docker 会把缺失的挂载源建成
+`root:root`,entrypoint 以 root 启动时把它们 chown 成 `10001:10001`,然后用 gosu 降到
+uid 10001 再跑面板 —— 面板进程本身不是 root(`docker compose exec panel id` 可验证)。
+
+要自己管属主(宿主用了别的 uid、或不接受容器短暂持有 root):
+
+```bash
+# 二选一,都会跳过自动 chown,并在属主不对时直接报错退出
 PANEL_FIX_OWNERSHIP=0 docker compose up -d
 # 或在 docker-compose.yml 的 panel 下加 user: "10001:10001"
 ```
 
-没有 `.env` 就 `up` 会直接报
-`required variable MONITOR_TOKEN is missing a value` —— 这是故意的硬失败,不是 bug:
-容器内绑 `0.0.0.0`,没 Token 启动就是个无鉴权面板。
+数据布局(默认命名卷;叠加 `docker-compose.bind.yml` 后同一列变成 `./data/<名字>`):
 
-**`.env` 不需要映射进容器。** 它是 docker compose 在**宿主**上读的变量替换文件,compose
-读完把值作为真正的环境变量注入容器。上游没有任何 dotenv 依赖 —— `monitor.py`、
-`security_utils.py` 全部走 `os.environ.get`,容器里没人会去读 `.env`。挂进去只会多暴露
-一份 Token。(上游 `deploy/monitor.env.example` 是给 systemd `EnvironmentFile=` 用的,
-在 compose 部署里由 `.env` + `environment:` 取代。)
-
-不用手动建 `config.json` / `proxies.txt`:首次启动时 entrypoint 会在 `data/panel/` 里
-自动生成(`config.json` 从上游 `config.example.json` 拷,`proxies.txt` 建空文件),再
-软链进容器的 `/app/src`。所以 `up` 之前只要有 `data/panel/` 这个目录就行。
-
-起来之后编辑 `data/panel/config.json`,至少填好邮箱服务商配置(见上游 `DEPLOYMENT.md`
-第 2 节),再 `docker compose restart panel`。
-
-宿主目录布局:
-
-| 宿主路径 | 容器内 | 内容 |
+| 卷 / 宿主路径 | 容器内 | 内容 |
 | --- | --- | --- |
+| `panel-data` | `/app/src/panel-data` | `config.json` + `proxies.txt`(软链到 `/app/src/`)、`monitor_token` |
+| `cpa_auth` | `/app/src/cpa_auth` | CPA 授权文件 |
+| `grok2api_auth` | `/app/src/grok2api_auth` | grok2api 授权文件 |
+| `accounts` | `/app/src/accounts` | 注册产出账号、`sso_pending.txt` |
+| `log` | `/app/src/log` | 运行日志、`blacklist_state.json`、`monitor_control.json`、`monitor_stats.json`、`register_results.jsonl`、pid |
+| `camoufox` | `/home/app/.cache/camoufox` | 浏览器缓存(可重下,不必备份) |
 | `.env` | *(不挂载)* | compose 宿主侧变量:Token、镜像 tag、时区 |
-| `data/panel/config.json` | `/app/src/config.json`(软链) | 邮箱、代理、CPA 配置 |
-| `data/panel/proxies.txt` | `/app/src/proxies.txt`(软链) | 代理池(凭据材料) |
-| `data/cpa_auth/` | `/app/src/cpa_auth` | CPA 授权文件 |
-| `data/grok2api_auth/` | `/app/src/grok2api_auth` | grok2api 授权文件 |
-| `data/accounts/` | `/app/src/accounts` | 注册产出账号、`sso_pending.txt` |
-| `data/log/` | `/app/src/log` | 运行日志、`blacklist_state.json`、`monitor_control.json`、`monitor_stats.json`、`register_results.jsonl`、pid |
 
-`log/` 是整目录挂载,面板的全部运行时写入都落在里面(核对过 `monitor.py`、
+看/改命名卷里的文件不用先找宿主路径:
+
+```bash
+docker compose exec panel ls -la panel-data log accounts
+docker compose exec panel cat panel-data/config.json
+# 备份
+docker compose exec -T panel tar cf - panel-data cpa_auth grok2api_auth accounts > backup.tar
+```
+
+`log` 是整目录,面板的全部运行时写入都落在里面(核对过 `monitor.py`、
 `run_until_100.py`、`blacklist_store.py` 的写入路径,没有写到目录外的)。
 
-`config.json` 和 `proxies.txt` 挂的是 `data/panel/` **整目录**(容器内 `panel-data/`),
-不是单文件 —— 单文件 bind mount 在宿主路径缺失时会被 Docker 建成目录,挂目录就没这个坑,
-也让首次 `up` 免去手动 `touch`/`cp`。entrypoint 在目录里建实文件后软链到 `/app/src`。
-`config.json` 目前只被桌面版 `grok_register_ttk.py` 写,Web 面板只读;真要通过面板写它,
-因为现在是目录挂载,`secure_files.atomic_write_text` 的 mkstemp + `os.replace` 也不再跨
-挂载点 EXDEV 失败(临时文件落在同一个 `panel-data/` 目录内)。
+`config.json` 和 `proxies.txt` 放在 `panel-data/` **目录**里再软链进 `/app/src`,不是各挂
+一个单文件 —— 单文件 bind mount 在宿主路径缺失时会被 Docker 建成目录,挂目录就没这个坑,
+也让首次 `up` 免去手动 `touch`/`cp`。`config.json` 目前只被桌面版 `grok_register_ttk.py`
+写,Web 面板只读;真要通过面板写它,因为现在是目录挂载,`secure_files.atomic_write_text`
+的 mkstemp + `os.replace` 也不再跨挂载点 EXDEV 失败(临时文件落在同一个目录内)。
 
-> **从旧版单文件挂载升级:**
+> **从旧版升级:**
+>
+> 旧版(单文件挂载或 `data/` bind mount)的数据在宿主 `./data/` 里。想继续用宿主目录,
+> 把两个文件挪进 `data/panel/` 后叠加 bind 覆盖文件:
 >
 > ```bash
 > docker compose down
-> mkdir -p data/panel
-> mv data/config.json data/proxies.txt data/panel/    # 内容不变
-> docker compose pull && docker compose up -d
+> mkdir -p data/panel && mv data/config.json data/proxies.txt data/panel/  # 若还是旧布局
+> docker compose pull
+> docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d
 > ```
 >
 > 不用手工 `chown`:entrypoint 会把 `data/` 下这几个目录的属主一并修好,包括旧部署里
-> 被 Docker 建成 `root:root` 的 `data/log`、`data/accounts`、`data/cpa_auth`、
-> `data/grok2api_auth`。`pull` 别省 —— 自动修属主是新镜像才有的。
+> 被 Docker 建成 `root:root` 的那些。`pull` 别省 —— 自动修属主是新镜像才有的。
+>
+> 想改用命名卷(默认),把 `data/` 里的内容拷进去:
+>
+> ```bash
+> docker compose up -d      # 先让卷建出来
+> docker compose cp data/panel/. panel:/app/src/panel-data/
+> docker compose cp data/cpa_auth/. panel:/app/src/cpa_auth/
+> docker compose cp data/grok2api_auth/. panel:/app/src/grok2api_auth/
+> docker compose cp data/accounts/. panel:/app/src/accounts/
+> docker compose restart panel
+> ```
 
-授权目录用 bind mount 而不是命名卷,这样 grok2api 容器可以直接挂同一个宿主目录读取:
+要把授权目录给 grok2api 之类的另一个容器读,两种都行 —— 共享命名卷:
+
+```yaml
+  grok2api:
+    volumes:
+      - grok2api_auth:/app/data/auth:ro          # 路径按 grok2api 实际要求调整
+```
+
+或者用 `docker-compose.bind.yml` 落到宿主再挂:
 
 ```yaml
   grok2api:
@@ -95,10 +145,12 @@ PANEL_FIX_OWNERSHIP=0 docker compose up -d
       - ./data/grok2api_auth:/app/data/auth:ro   # 路径按 grok2api 实际要求调整
 ```
 
-entrypoint 启动时会检查这四个目录可写,不可写就直接退出 —— 比跑完一轮注册、烧掉一个
-邮箱之后才发现写不进授权文件要好。
+用命名卷时属主天然是对的:Docker 建新卷会从镜像里的挂载点继承属主(uid 10001)。bind
+mount 才需要 entrypoint 出手 chown。两种情况下 entrypoint 都会在启动时确认这几个目录可写,
+不可写就直接退出 —— 比跑完一轮注册、烧掉一个邮箱之后才发现写不进授权文件要好。
 
-面板地址 `http://127.0.0.1:8787`,打开后在"访问令牌"填 `.env` 里的 `MONITOR_TOKEN`。
+面板地址 `http://127.0.0.1:8787`,打开后在"访问令牌"填 Token
+(`docker compose exec panel cat panel-data/monitor_token`,或 `.env` 里你自己设的)。
 
 ## 2. 跟随上游更新
 
@@ -133,12 +185,18 @@ cron 里。
 `[deps] requirements.txt changed, installing`。这是临时兜底:装出来的东西不在镜像层,
 容器 recreate 就没了,新镜像出来后 `pull` 一次固化回去。
 
-上游升 Camoufox 版本时,`pip install` 补不上浏览器包(在命名卷里),要清卷:
+上游升 Camoufox 版本时,`pip install` 补不上浏览器包(在命名卷里),要清卷。卷名带
+compose 项目名前缀(默认是目录名),先查一下再删,别手写:
 
 ```bash
-docker compose down && docker volume rm grok-register-panel-docker_camoufox
+docker volume ls --filter name=camoufox     # 先看实际卷名,通常是 <目录名>_camoufox
+docker compose down
+docker volume rm <上一步看到的卷名>
 docker compose up -d
 ```
+
+只删 `camoufox` 卷是安全的,里面只有可重新下载的浏览器二进制。**别用
+`docker compose down -v`** —— 那会连账号、Token、`config.json` 一起删掉。
 
 想固定版本、不跟随:
 
@@ -157,7 +215,7 @@ UPSTREAM_AUTO_UPDATE=0 docker compose up -d    # 冻结在镜像构建时的快�
 ```bash
 # 在你本地机器上执行
 ssh -N -L 8787:127.0.0.1:8787 root@<服务器IP>
-# 本地浏览器开 http://127.0.0.1:8787,"访问令牌"填 .env 里的 MONITOR_TOKEN
+# 本地浏览器开 http://127.0.0.1:8787,"访问令牌"填 monitor_token 里的值
 ```
 
 不要为了图方便把映射改成 `"8787:8787"` —— 那等于把内置 HTTP 服务裸放公网,上游明确说它
@@ -166,11 +224,14 @@ ssh -N -L 8787:127.0.0.1:8787 root@<服务器IP>
 ## 4. 验证
 
 ```bash
-docker compose logs --tail=30 panel     # 看 [upstream] 和 [deps] 两行
+docker compose logs --tail=30 panel     # 看 [upstream]、[deps]、[token] 几行
 docker compose exec panel smoke.sh
+docker compose exec panel id            # 期望 uid=10001,不是 0
+
+tok="$(docker compose exec -T panel cat panel-data/monitor_token)"
 curl -fsS http://127.0.0.1:8787/api/health
 curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/status          # 期望 401
-curl -H "Authorization: Bearer $MONITOR_TOKEN" http://127.0.0.1:8787/api/status # 期望 200
+curl -H "Authorization: Bearer $tok" http://127.0.0.1:8787/api/status           # 期望 200
 ```
 
 `smoke.sh` 检查几件容易在改动 entrypoint 后悄悄坏掉的事:`.venv/bin/python` 可执行
@@ -187,9 +248,15 @@ Camoufox 浏览器已下载、`xvfb-run` 和 `/proc` 可用(`process_utils.py` �
 - **probe** — 只用 GitHub API:解析上游 HEAD、取 `requirements.txt` 的 sha256,和已发布镜像
   的 `io.grokpanel.reqs-sha256` label 比。定时触发且依赖没变 → 不构建。
 - **build** — buildx 推 GHCR,三个 tag:`latest`、`reqs-<sha256>`、`upstream-<rev>`;
-  推完 `docker run ... smoke.sh` 自检,起不来就红。自检除了两个架构各跑一遍,还专门挂一组
-  `root:root` 的宿主目录进去,验证 entrypoint 能自动修属主、`config.json` 真的落在挂载的
-  宿主侧;再用 `PANEL_FIX_OWNERSHIP=0` 跑一次,确认退出码非 0 且报错点出了不可写的挂载。
+  推完跑四组自检,任一失败就红:
+  - `docker run ... smoke.sh`,两个架构各一遍。
+  - 挂一组 `root:root` 的宿主目录进去,验证 entrypoint 能自动修属主、`config.json` 真的
+    落在挂载的宿主侧。
+  - `PANEL_FIX_OWNERSHIP=0` 再跑一次,确认退出码非 0 且报错点出了不可写的挂载。
+  - **在空临时目录里只放一份 `docker-compose.yml` 就 `up -d --wait`** —— 没有 `.env`、
+    没有 `data/`、没有预建卷,复刻用户拉取即用的路径。等 HEALTHCHECK 转绿后校验生成的
+    Token 是 64 位 hex、`/api/status` 不带 Token 401 带 Token 200,再 `down`/`up` 一次
+    确认 Token 没变(即命名卷真的持久化了)。
 
 触发:每天 04:17 UTC 定时、改 `Dockerfile`/`docker/**` 时 push、手动 dispatch。
 
@@ -218,7 +285,8 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 | 容器内 `MONITOR_HOST=0.0.0.0`,端口只发布到 `127.0.0.1` | 容器网络里绑 loopback 就没法从宿主访问;隔离交给端口发布,不是绑定地址 |
 | 镜像内装 xvfb + procps | 注册流程走 `xvfb-run`,面板停止进程要读 `/proc` 和 `ps` |
 | 同时出 amd64 和 arm64 | Camoufox 两个架构都有原生 Firefox 构建,ARM 云主机(Ampere、Graviton)能原生跑,不必 QEMU |
-| 授权目录 bind mount,只有 camoufox 缓存用命名卷 | 授权文件是这个面板的产出,要能被 grok2api 读、能直接备份;camoufox 是可重下的缓存,不需要在宿主可见 |
+| 默认命名卷,bind mount 放到单独的覆盖文件里 | 拉了就能 `up -d` 是首要目标;新建命名卷会从镜像继承 uid 10001,而缺失的 bind mount 源被 Docker 建成 `root:root`,正是那个把首次部署卡进重启循环的坑。要宿主可见(给 grok2api 挂、`tar` 备份)时叠加 `docker-compose.bind.yml` |
+| 没有 `MONITOR_TOKEN` 就自动生成一个,存进 `panel-data/` | 原来是硬失败,等于强制用户先写 `.env` 才能启动,"拉取即用"做不到;而上游 `check_token_optional_read` 在 token 为空时**放行所有读接口**,所以"总是有 token"比"没 token 就拒绝启动"更安全 |
 | `config.json`/`proxies.txt` 挂目录 `panel-data/` 再软链,不直接挂单文件 | 缺失的宿主单文件会被 Docker 建成目录,首次 `up` 就崩;挂目录则由 entrypoint 兜底创建两个文件并软链进 `src/`,新部署无需手动 `touch`/`cp` |
 | 非 root 运行(uid 10001) | 面板会 spawn 子进程、写凭据文件,不该有 root |
 | entrypoint 以 root 起,chown 完挂载后 gosu 降权 | Docker 把缺失的挂载源建成 `root:root`,靠文档要求用户先 chown 是行不通的(删掉 `data/` 重来就会复现);容器自己修,面板进程仍是 uid 10001 |
@@ -230,6 +298,13 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 并保持 `PANEL_INCLUDE_TAIL=0`。`MONITOR_TOKEN` 是唯一的鉴权凭据,别写进 URL、
 命令行参数或仓库。
 
+**自动生成的 Token 是真鉴权,不是占位。** 32 字节 `/dev/urandom` 转 hex,`0600` 存在
+`panel-data/monitor_token`(命名卷或 `data/panel/`,不入库)。要点在于上游
+`check_token_optional_read` 对读接口是"没配 token 就放行":Token 为空时 `/api/status`
+等接口无需鉴权即可读。所以这里的选择不是"生成 vs 不生成",而是"生成 vs 裸奔"。
+自己在 `.env` 里设 `MONITOR_TOKEN` 时不会被覆盖,也不会写这个文件。
+CI 每次构建都验一遍:不带 Token 请求 `/api/status` 必须 401,带上必须 200。
+
 **容器启动的头几毫秒是 root。** entrypoint 只用这段时间 `chown` 那几个挂载目录,随即
 `gosu` 降到 uid 10001 再 exec 面板 —— 上游代码、`git` 同步、浏览器子进程全部在降权之后,
 没有一行以 root 跑(`smoke.sh` 里有 `id -u != 0` 的断言守着)。不接受这个窗口的话用
@@ -238,7 +313,8 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 `/opt/venv` 对 app 用户可写,这样上游升依赖时能先跑起来、不必等 CI 出镜像。代价是面板进程
 理论上能改 `site-packages`。不接受的话:设 `AUTO_PIP_INSTALL=0`,依赖变动一律等 CI 新镜像。
 
-`.env` 里是 `MONITOR_TOKEN`,`chmod 600`,已在 `.gitignore` 里。`data/` 同样不入库。
+默认布局下 Token 和账号数据都在命名卷里,压根不在仓库目录中。叠加
+`docker-compose.bind.yml` 后落到 `./data/`,和自己写的 `.env` 一样已在 `.gitignore` 里。
 
 启动时源码从上游 `main` 拉取,等于信任上游仓库的每个新 commit。要审过再上,用
 `UPSTREAM_REF` 钉 tag 或 `UPSTREAM_AUTO_UPDATE=0` 冻结。

@@ -99,26 +99,29 @@ mkdir -p "$DATA_DIR"
 # bad dir in one pass, so restart:unless-stopped does not make the user restart
 # once per directory to discover the next name.
 bad=''
-# "container-path host-path" pairs; the loop splits on the space. $DATA_DIR is
-# absolute, the others are relative to $APP_DIR (we cd'd there above).
+# "container-path bind-host-path" pairs; the loop splits on the space. The host
+# path only applies under docker-compose.bind.yml -- with the default named
+# volumes there is no host path worth printing, so it is labelled as such below.
+# $DATA_DIR is absolute, the others are relative to $APP_DIR (we cd'd there).
 for pair in "log data/log" "accounts data/accounts" "cpa_auth data/cpa_auth" \
             "grok2api_auth data/grok2api_auth" "$DATA_DIR data/panel"; do
     d="${pair% *}"
     host="${pair#* }"
     [ -w "$d" ] && continue
-    bad="$bad  $d (host $host) is owned by $(stat -c '%u:%g' "$d")
+    bad="$bad  $d is owned by $(stat -c '%u:%g' "$d") (bind layout: host $host)
 "
 done
 if [ -n "$bad" ]; then
-    echo "These bind mounts are not writable by uid $(id -u):" >&2
+    echo "These mounts are not writable by uid $(id -u):" >&2
     printf '%s' "$bad" >&2
-    echo "Docker creates a missing bind-mount source as root:root. This image" >&2
-    echo "normally starts as root, chowns them to $PANEL_UID:$PANEL_GID and then drops" >&2
-    echo "privileges -- but that was skipped, either by PANEL_FIX_OWNERSHIP=0 or" >&2
-    echo "by a compose \`user:\` override that started us as uid $(id -u) already." >&2
-    echo "Drop whichever one you set, or fix ownership on the host yourself --" >&2
-    echo "the whole tree, not just the dirs named above:" >&2
-    echo "  sudo chown -R $PANEL_UID:$PANEL_GID data && docker compose restart panel" >&2
+    echo "This image normally starts as root, chowns them to $PANEL_UID:$PANEL_GID and" >&2
+    echo "then drops privileges -- but that was skipped, either by" >&2
+    echo "PANEL_FIX_OWNERSHIP=0 or by a compose \`user:\` override that started us" >&2
+    echo "as uid $(id -u) already. Dropping whichever one you set is the fix." >&2
+    echo "Keeping it means owning the problem yourself:" >&2
+    echo "  named volumes  - docker run --rm -v <volume>:/v alpine chown -R $PANEL_UID:$PANEL_GID /v" >&2
+    echo "  bind mounts    - sudo chown -R $PANEL_UID:$PANEL_GID data   (the whole tree)" >&2
+    echo "then: docker compose restart panel" >&2
     exit 1
 fi
 
@@ -127,8 +130,10 @@ if [ ! -f "$DATA_DIR/config.json" ]; then
     # the || list, so a missing example would make set -e kill the container with
     # no message at all.
     [ -f config.example.json ] || {
-        echo "config.example.json is missing from the upstream checkout;" >&2
-        echo "write $DATA_DIR/config.json on the host by hand and restart" >&2
+        echo "config.example.json is missing from the upstream checkout, so there is" >&2
+        echo "nothing to seed $DATA_DIR/config.json from -- upstream renamed or removed" >&2
+        echo "it. Pin a known-good revision (UPSTREAM_REF=<tag>) or write the config" >&2
+        echo "yourself, then restart." >&2
         exit 1
     }
     cp config.example.json "$DATA_DIR/config.json"
@@ -137,6 +142,38 @@ fi
 ln -sfn "$DATA_DIR/config.json" config.json
 ln -sfn "$DATA_DIR/proxies.txt" proxies.txt
 
+# A pulled image has to be runnable with no host-side setup, so generate a token
+# on first start rather than refusing to boot without one. Not just a
+# convenience: upstream check_token_optional_read() returns True for reads when
+# MONITOR_TOKEN is empty, so booting tokenless would leave every read endpoint
+# open. Kept in $DATA_DIR, which is a mount (named volume by default, ./data/panel
+# under docker-compose.bind.yml), so it survives restart and recreate; umask 0077
+# above already makes it 0600.
+if [ -z "${MONITOR_TOKEN:-}" ]; then
+    token_file="$DATA_DIR/monitor_token"
+    if [ -s "$token_file" ]; then
+        MONITOR_TOKEN="$(cat "$token_file")"
+        echo "[token] using the generated token; read it with:"
+        echo "[token]   docker compose exec panel cat panel-data/monitor_token"
+    else
+        # od, not openssl/uuidgen: neither is in the image. This is the same 32
+        # bytes of /dev/urandom as hex that `openssl rand -hex 32` would give.
+        MONITOR_TOKEN="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+        [ "${#MONITOR_TOKEN}" = 64 ] || {
+            echo "[token] could not read 32 bytes from /dev/urandom" >&2
+            exit 1
+        }
+        printf '%s\n' "$MONITOR_TOKEN" > "$token_file"
+        echo "[token] no MONITOR_TOKEN was set, so one was generated for you:"
+        echo "[token]   $MONITOR_TOKEN"
+        echo "[token] saved to panel-data/monitor_token. Set MONITOR_TOKEN in"
+        echo "[token] .env instead if you would rather pin your own."
+    fi
+    export MONITOR_TOKEN
+fi
+
+# Safety net for the paths that skip generation (explicitly empty MONITOR_TOKEN,
+# or a future edit that reorders this). Never serve 0.0.0.0 unauthenticated.
 case "${MONITOR_HOST:-}" in
     127.*|localhost|::1) ;;
     *) [ -n "${MONITOR_TOKEN:-}" ] || {
