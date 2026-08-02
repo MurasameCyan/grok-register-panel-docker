@@ -20,8 +20,11 @@ ENV PYTHONUNBUFFERED=1 \
     UPSTREAM_REF=${UPSTREAM_REF} \
     PATH=/opt/venv/bin:$PATH
 
+# gosu: the entrypoint starts as root only to chown the bind mounts, then execs
+# itself as uid 10001. Docker creates missing bind-mount sources as root:root,
+# so without this every fresh `up` needs a manual host-side chown first.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git ca-certificates tini xvfb procps curl \
+        git ca-certificates tini xvfb procps curl gosu \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 10001 app
@@ -56,11 +59,11 @@ COPY docker/entrypoint.sh docker/smoke.sh /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/smoke.sh \
     && chown -R app:app /app "$VENV_DIR"
 
-USER app
 WORKDIR /app/src
 
-# Bundled Camoufox browser (~150 MB) into the app user's cache dir.
-RUN camoufox fetch && camoufox version
+# Bundled Camoufox browser (~150 MB) into the app user's cache dir. Runs as app
+# so the download lands in /home/app/.cache owned by the runtime user.
+RUN gosu app camoufox fetch && gosu app camoufox version
 
 # CPA_AUTH_DIR is a path, not a credential; buildkit's SecretsUsedInArgOrEnv
 # rule only pattern-matches the "AUTH" substring.
@@ -81,6 +84,12 @@ LABEL org.opencontainers.image.source="https://github.com/lij768423-svg/grok-reg
       io.grokpanel.upstream-rev="${UPSTREAM_REV}" \
       io.grokpanel.reqs-sha256="${REQS_SHA256}"
 
+# No `USER app`: the entrypoint needs root to chown the bind mounts Docker
+# created as root:root, then execs itself under gosu as uid 10001. The panel
+# itself never runs as root -- verify with `docker compose exec panel id`.
+# Set PANEL_FIX_OWNERSHIP=0 (or compose `user: "10001:10001"`) to opt out and
+# manage host ownership yourself.
+#
 # -s: compose sets `init: true`, so Docker's own init owns PID 1 and tini runs
 # as a child. Without -s tini warns it cannot reap, and orphaned xvfb/firefox
 # processes from a killed batch would accumulate as zombies.

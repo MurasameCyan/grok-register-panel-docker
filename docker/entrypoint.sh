@@ -5,7 +5,35 @@ umask 0077
 
 APP_DIR="${APP_DIR:-/app/src}"
 VENV_DIR="${VENV_DIR:-/opt/venv}"
+PANEL_UID="${PANEL_UID:-10001}"
+PANEL_GID="${PANEL_GID:-10001}"
+DATA_DIR="${PANEL_DATA_DIR:-$APP_DIR/panel-data}"
 cd "$APP_DIR"
+
+# Docker creates a bind mount's host directory as root:root when it does not
+# exist yet, so a first `up` hands the container four or five unwritable mounts
+# no matter what the docs say to chown beforehand. Fix it here instead of
+# demanding the host get it right: take ownership while we still have root,
+# then drop to $PANEL_UID for everything below -- the upstream git sync must
+# NOT run as root or it leaves root-owned objects in $APP_DIR/.git.
+if [ "$(id -u)" = 0 ]; then
+    if [ "${PANEL_FIX_OWNERSHIP:-1}" = "1" ]; then
+        for d in log accounts cpa_auth grok2api_auth "$DATA_DIR"; do
+            mkdir -p "$d"
+            # -R is the expensive part, so only recurse when the directory
+            # itself is wrong; that is exactly the freshly-created-by-Docker
+            # case. An already-correct mount costs one stat.
+            [ "$(stat -c '%u:%g' "$d")" = "$PANEL_UID:$PANEL_GID" ] && continue
+            chown -R "$PANEL_UID:$PANEL_GID" "$d"
+        done
+    fi
+    # Outside the PANEL_FIX_OWNERSHIP guard on purpose: opting out of the chown
+    # must not also opt out of dropping privileges, or the git sync below would
+    # run as root and leave root-owned objects in .git.
+    # gosu, not su/setpriv: it drops the whole supplementary-group set and
+    # execs without an intervening shell, so signals from tini reach the panel.
+    exec gosu "$PANEL_UID:$PANEL_GID" "$0" "$@"
+fi
 
 # monitor.py / run_until_100.py spawn workers via the literal path
 # ROOT/.venv/bin/python, so the venv must be reachable there.
@@ -61,15 +89,15 @@ mkdir -p log accounts cpa_auth grok2api_auth
 # app reads into it. This is also why a fresh `up` needs no manual touch/cp:
 # the files below are created on first start. config.json and proxies*.txt are
 # gitignored upstream and panel-data/ is untracked, so the `git reset --hard`
-# above touches none of them.
-DATA_DIR="${PANEL_DATA_DIR:-$APP_DIR/panel-data}"
+# above touches none of them. DATA_DIR is set at the top, before the root block.
 mkdir -p "$DATA_DIR"
 
-# Bind-mounted dirs keep host ownership. Fail now rather than after a register
-# run has already spent an email address and cannot write the auth file.
-# Report every bad dir in one pass: `up` before the chown usually leaves all of
-# them root-owned, and restart:unless-stopped would otherwise make the user
-# restart once per directory to discover the next name.
+# Fallback path only: the root block above normally fixes ownership before we
+# get here. Reachable when the container starts as non-root (`user:` in compose)
+# or with PANEL_FIX_OWNERSHIP=0. Fail now rather than after a register run has
+# already spent an email address and cannot write the auth file. Report every
+# bad dir in one pass, so restart:unless-stopped does not make the user restart
+# once per directory to discover the next name.
 bad=''
 # "container-path host-path" pairs; the loop splits on the space. $DATA_DIR is
 # absolute, the others are relative to $APP_DIR (we cd'd there above).
@@ -84,12 +112,13 @@ done
 if [ -n "$bad" ]; then
     echo "These bind mounts are not writable by uid $(id -u):" >&2
     printf '%s' "$bad" >&2
-    echo "The host dirs are owned by someone else -- Docker creates a missing" >&2
-    echo "bind-mount source as root, so an \`up\` that ran before the chown" >&2
-    echo "leaves them root-owned. Run this on the host, in the compose" >&2
-    echo "directory -- it covers every dir listed above at once, and note it" >&2
-    echo "is the whole data/ tree, not just the dirs named:" >&2
-    echo "  sudo chown -R 10001:10001 data && docker compose restart panel" >&2
+    echo "Docker creates a missing bind-mount source as root:root. This image" >&2
+    echo "normally starts as root, chowns them to $PANEL_UID:$PANEL_GID and then drops" >&2
+    echo "privileges -- but that was skipped, either by PANEL_FIX_OWNERSHIP=0 or" >&2
+    echo "by a compose \`user:\` override that started us as uid $(id -u) already." >&2
+    echo "Drop whichever one you set, or fix ownership on the host yourself --" >&2
+    echo "the whole tree, not just the dirs named above:" >&2
+    echo "  sudo chown -R $PANEL_UID:$PANEL_GID data && docker compose restart panel" >&2
     exit 1
 fi
 

@@ -151,3 +151,39 @@ jobs:
               -e UPSTREAM_AUTO_UPDATE=0 -e MONITOR_HOST=127.0.0.1 \
               "$TAG" smoke.sh
           done
+
+          # The bug this image kept hitting: Docker creates a missing bind-mount
+          # source as root:root, so mount root-owned dirs and require the
+          # entrypoint to chown them and still land on uid 10001. smoke.sh's own
+          # writability checks are what would fail if the fix regressed.
+          echo "--- root-owned bind mounts are adopted ---"
+          host="$(mktemp -d)"
+          sudo mkdir -p "$host"/panel "$host"/log "$host"/accounts \
+                        "$host"/cpa_auth "$host"/grok2api_auth
+          sudo chown -R 0:0 "$host"
+          docker run --rm --shm-size=1g \
+            -e UPSTREAM_AUTO_UPDATE=0 -e MONITOR_HOST=127.0.0.1 \
+            -v "$host/panel":/app/src/panel-data \
+            -v "$host/log":/app/src/log \
+            -v "$host/accounts":/app/src/accounts \
+            -v "$host/cpa_auth":/app/src/cpa_auth \
+            -v "$host/grok2api_auth":/app/src/grok2api_auth \
+            "$TAG" smoke.sh
+          # config.json must exist on the HOST side afterwards, proving the
+          # entrypoint wrote through the mount rather than into the image layer.
+          sudo test -f "$host/panel/config.json" \
+            || { echo "entrypoint did not create config.json in the mount" >&2; exit 1; }
+          echo "host-side owner: $(sudo stat -c '%u:%g' "$host/panel/config.json")"
+
+          # Opting out must still fail loudly instead of starting half-broken.
+          echo "--- PANEL_FIX_OWNERSHIP=0 refuses root-owned mounts ---"
+          if docker run --rm --shm-size=1g \
+               -e UPSTREAM_AUTO_UPDATE=0 -e MONITOR_HOST=127.0.0.1 \
+               -e PANEL_FIX_OWNERSHIP=0 \
+               -v "$host/log":/app/src/log \
+               "$TAG" smoke.sh 2>&1 | tee /tmp/optout.log; then
+            echo "expected a non-zero exit with PANEL_FIX_OWNERSHIP=0" >&2; exit 1
+          fi
+          grep -q 'not writable by uid' /tmp/optout.log \
+            || { echo "opt-out failed without naming the unwritable mounts" >&2; exit 1; }
+          sudo rm -rf "$host"

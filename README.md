@@ -13,11 +13,6 @@ CI 也按这个规则判断:定时任务比对上游 `requirements.txt` 的 sha2
 ## 1. 首次部署
 
 ```bash
-mkdir -p data/panel data/cpa_auth data/grok2api_auth data/accounts data/log
-
-chmod 700 data/panel data/cpa_auth data/grok2api_auth data/accounts data/log
-sudo chown -R 10001:10001 data          # 容器内是 uid 10001
-
 # hex 而非 base64:base64 会产生 + / = ,compose 解析 .env 时容易出岔
 printf 'MONITOR_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
 chmod 600 .env
@@ -25,20 +20,19 @@ chmod 600 .env
 docker compose up -d --pull always      # 直接拉 GHCR 镜像,不构建
 ```
 
-**`mkdir` + `chown` 必须在 `up` 之前。** bind mount 的宿主目录不存在时,Docker 会用 root
-把它建出来,容器内 uid 10001 就写不进去。已经踩了的话日志会每隔几秒重复:
+`data/` 下的目录不用先建、也不用 `chown`。Docker 会把缺失的挂载源建成 `root:root`,
+entrypoint 以 root 启动时把它们 chown 成 `10001:10001`,然后用 gosu 降到 uid 10001 再跑
+面板 —— 面板进程本身不是 root(`docker compose exec panel id` 可验证)。
 
-```
-These bind mounts are not writable by uid 10001:
-  log (host data/log) is owned by 0:0
-  ...
-```
+> 早期版本要求手工 `mkdir` + `chown` 在 `up` 之前完成,漏了就会陷入
+> `not writable by uid 10001` 的重启循环。现在容器自己处理,那一步已经不需要了。
 
-补一次 `chown` 即可,不用重建容器(`restart: unless-stopped` 会一直重试,所以日志刷屏是
-预期的退避行为,不是二次故障):
+要自己管属主(比如宿主用了别的 uid、或不接受容器短暂持有 root):
 
 ```bash
-sudo chown -R 10001:10001 data && docker compose restart panel
+# 二选一,两种都会跳过自动 chown,并在属主不对时直接报错退出
+PANEL_FIX_OWNERSHIP=0 docker compose up -d
+# 或在 docker-compose.yml 的 panel 下加 user: "10001:10001"
 ```
 
 没有 `.env` 就 `up` 会直接报
@@ -86,13 +80,12 @@ sudo chown -R 10001:10001 data && docker compose restart panel
 > docker compose down
 > mkdir -p data/panel
 > mv data/config.json data/proxies.txt data/panel/    # 内容不变
-> sudo chown -R 10001:10001 data                      # 整个 data,不只 data/panel
-> docker compose up -d
+> docker compose pull && docker compose up -d
 > ```
 >
-> 最后那次 `chown` 别漏:旧部署里 `data/log`、`data/accounts`、`data/cpa_auth`、
-> `data/grok2api_auth` 很可能是 Docker 用 root 建的(`0:0`),只 chown 新建的
-> `data/panel` 会让容器卡在上面那个 "not writable" 循环里。
+> 不用手工 `chown`:entrypoint 会把 `data/` 下这几个目录的属主一并修好,包括旧部署里
+> 被 Docker 建成 `root:root` 的 `data/log`、`data/accounts`、`data/cpa_auth`、
+> `data/grok2api_auth`。`pull` 别省 —— 自动修属主是新镜像才有的。
 
 授权目录用 bind mount 而不是命名卷,这样 grok2api 容器可以直接挂同一个宿主目录读取:
 
@@ -183,7 +176,8 @@ curl -H "Authorization: Bearer $MONITOR_TOKEN" http://127.0.0.1:8787/api/status 
 `smoke.sh` 检查几件容易在改动 entrypoint 后悄悄坏掉的事:`.venv/bin/python` 可执行
 (`monitor.py`、`run_until_100.py` 用硬编码路径拉起 worker)、运行时依赖能 import、
 Camoufox 浏览器已下载、`xvfb-run` 和 `/proc` 可用(`process_utils.py` 靠 `/proc` 找进程)、
-`config.json` 与 `proxies.txt` 已由 entrypoint 创建并软链成常规文件,
+`config.json` 与 `proxies.txt` 已由 entrypoint 创建并软链成常规文件、
+当前 uid 不是 0(确认 entrypoint 真的降权了),
 再做一次真实的 `git reset --hard` 确认 `log/` 下的运行数据没被冲掉。
 
 ## 5. CI
@@ -193,7 +187,9 @@ Camoufox 浏览器已下载、`xvfb-run` 和 `/proc` 可用(`process_utils.py` �
 - **probe** — 只用 GitHub API:解析上游 HEAD、取 `requirements.txt` 的 sha256,和已发布镜像
   的 `io.grokpanel.reqs-sha256` label 比。定时触发且依赖没变 → 不构建。
 - **build** — buildx 推 GHCR,三个 tag:`latest`、`reqs-<sha256>`、`upstream-<rev>`;
-  推完 `docker run ... smoke.sh` 自检,起不来就红。
+  推完 `docker run ... smoke.sh` 自检,起不来就红。自检除了两个架构各跑一遍,还专门挂一组
+  `root:root` 的宿主目录进去,验证 entrypoint 能自动修属主、`config.json` 真的落在挂载的
+  宿主侧;再用 `PANEL_FIX_OWNERSHIP=0` 跑一次,确认退出码非 0 且报错点出了不可写的挂载。
 
 触发:每天 04:17 UTC 定时、改 `Dockerfile`/`docker/**` 时 push、手动 dispatch。
 
@@ -225,6 +221,7 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 | 授权目录 bind mount,只有 camoufox 缓存用命名卷 | 授权文件是这个面板的产出,要能被 grok2api 读、能直接备份;camoufox 是可重下的缓存,不需要在宿主可见 |
 | `config.json`/`proxies.txt` 挂目录 `panel-data/` 再软链,不直接挂单文件 | 缺失的宿主单文件会被 Docker 建成目录,首次 `up` 就崩;挂目录则由 entrypoint 兜底创建两个文件并软链进 `src/`,新部署无需手动 `touch`/`cp` |
 | 非 root 运行(uid 10001) | 面板会 spawn 子进程、写凭据文件,不该有 root |
+| entrypoint 以 root 起,chown 完挂载后 gosu 降权 | Docker 把缺失的挂载源建成 `root:root`,靠文档要求用户先 chown 是行不通的(删掉 `data/` 重来就会复现);容器自己修,面板进程仍是 uid 10001 |
 
 ## 7. 安全边界
 
@@ -232,6 +229,11 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 `127.0.0.1`,不是公网可达。要对外暴露,放到带 TLS 和额外身份认证的反向代理后面,
 并保持 `PANEL_INCLUDE_TAIL=0`。`MONITOR_TOKEN` 是唯一的鉴权凭据,别写进 URL、
 命令行参数或仓库。
+
+**容器启动的头几毫秒是 root。** entrypoint 只用这段时间 `chown` 那几个挂载目录,随即
+`gosu` 降到 uid 10001 再 exec 面板 —— 上游代码、`git` 同步、浏览器子进程全部在降权之后,
+没有一行以 root 跑(`smoke.sh` 里有 `id -u != 0` 的断言守着)。不接受这个窗口的话用
+`PANEL_FIX_OWNERSHIP=0` 或 compose `user:`,代价是属主要你自己在宿主上管。
 
 `/opt/venv` 对 app 用户可写,这样上游升依赖时能先跑起来、不必等 CI 出镜像。代价是面板进程
 理论上能改 `site-packages`。不接受的话:设 `AUTO_PIP_INSTALL=0`,依赖变动一律等 CI 新镜像。

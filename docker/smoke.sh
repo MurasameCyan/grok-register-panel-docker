@@ -25,6 +25,10 @@ for f in config.json proxies.txt; do
     [ -f "$f" ] || fail "$f is not a regular file (entrypoint did not create/link it)"
 done
 
+# The entrypoint starts as root to chown the mounts, then gosu-execs itself as
+# 10001. If that drop ever regressed, the panel would spawn browsers as root.
+[ "$(id -u)" != 0 ] || fail "still running as root (entrypoint did not drop to uid 10001)"
+
 git rev-parse HEAD >/dev/null 2>&1 || fail "not a git checkout (upstream sync impossible)"
 
 # Reset to the revision already checked out: exercises the real code path the
