@@ -22,14 +22,11 @@ services:
     ports:
       - "127.0.0.1:8787:8787"
     volumes:
-      # Create these two files before the first `up`, or Docker will make
-      # directories out of them: see README.md step 1.
-      - ./data/config.json:/app/src/config.json
-      - ./data/proxies.txt:/app/src/proxies.txt
-      # Read-only in the web-panel code path (only the Tk desktop app writes
-      # config.json). Do NOT let anything write these through a single-file
-      # mount: secure_files.atomic_write_text does mkstemp+os.replace and the
-      # rename would fail EXDEV across the mount point.
+      # config.json + proxies.txt live in this ONE directory; the entrypoint
+      # creates them on first start (from config.example.json / empty) and
+      # symlinks them into /app/src, so a fresh `up` needs no manual touch/cp
+      # and Docker can't turn a missing single file into a directory.
+      - ./data/panel:/app/src/panel-data
       # Credential material, bind-mounted so grok2api / CPA can read it and so
       # you can back it up without docker cp. Host side must be 0700 uid 10001.
       - ./data/cpa_auth:/app/src/cpa_auth

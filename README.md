@@ -13,13 +13,9 @@ CI 也按这个规则判断:定时任务比对上游 `requirements.txt` 的 sha2
 ## 1. 首次部署
 
 ```bash
-mkdir -p data/cpa_auth data/grok2api_auth data/accounts data/log
-curl -fsSL https://raw.githubusercontent.com/lij768423-svg/grok-register-panel/main/config.example.json \
-  -o data/config.json
-touch data/proxies.txt
+mkdir -p data/panel data/cpa_auth data/grok2api_auth data/accounts data/log
 
-chmod 600 data/config.json data/proxies.txt
-chmod 700 data/cpa_auth data/grok2api_auth data/accounts data/log
+chmod 700 data/panel data/cpa_auth data/grok2api_auth data/accounts data/log
 sudo chown -R 10001:10001 data          # 容器内是 uid 10001
 
 # hex 而非 base64:base64 会产生 + / = ,compose 解析 .env 时容易出岔
@@ -39,17 +35,20 @@ docker compose up -d --pull always      # 直接拉 GHCR 镜像,不构建
 一份 Token。(上游 `deploy/monitor.env.example` 是给 systemd `EnvironmentFile=` 用的,
 在 compose 部署里由 `.env` + `environment:` 取代。)
 
-`data/config.json` 里至少填好邮箱服务商配置(见上游 `DEPLOYMENT.md` 第 2 节)。
-`data/config.json` 与 `data/proxies.txt` 必须在第一次 `up` 之前存在,否则 Docker 会把
-它们创建成目录。
+不用手动建 `config.json` / `proxies.txt`:首次启动时 entrypoint 会在 `data/panel/` 里
+自动生成(`config.json` 从上游 `config.example.json` 拷,`proxies.txt` 建空文件),再
+软链进容器的 `/app/src`。所以 `up` 之前只要有 `data/panel/` 这个目录就行。
+
+起来之后编辑 `data/panel/config.json`,至少填好邮箱服务商配置(见上游 `DEPLOYMENT.md`
+第 2 节),再 `docker compose restart panel`。
 
 宿主目录布局:
 
 | 宿主路径 | 容器内 | 内容 |
 | --- | --- | --- |
 | `.env` | *(不挂载)* | compose 宿主侧变量:Token、镜像 tag、时区 |
-| `data/config.json` | `/app/src/config.json` | 邮箱、代理、CPA 配置 |
-| `data/proxies.txt` | `/app/src/proxies.txt` | 代理池(凭据材料) |
+| `data/panel/config.json` | `/app/src/config.json`(软链) | 邮箱、代理、CPA 配置 |
+| `data/panel/proxies.txt` | `/app/src/proxies.txt`(软链) | 代理池(凭据材料) |
 | `data/cpa_auth/` | `/app/src/cpa_auth` | CPA 授权文件 |
 | `data/grok2api_auth/` | `/app/src/grok2api_auth` | grok2api 授权文件 |
 | `data/accounts/` | `/app/src/accounts` | 注册产出账号、`sso_pending.txt` |
@@ -58,10 +57,15 @@ docker compose up -d --pull always      # 直接拉 GHCR 镜像,不构建
 `log/` 是整目录挂载,面板的全部运行时写入都落在里面(核对过 `monitor.py`、
 `run_until_100.py`、`blacklist_store.py` 的写入路径,没有写到目录外的)。
 
-`config.json` 目前只被桌面版 `grok_register_ttk.py` 写,Web 面板只读,所以单文件挂载可用。
-**但别让任何东西通过这个单文件挂载去写它** —— `secure_files.atomic_write_text` 用
-mkstemp + `os.replace`,跨挂载点 rename 会 EXDEV 失败。要是以后上游给面板加了保存配置的
-功能,把这里改成挂 `data/` 整目录,或在容器内保留 config.json 副本、启动时从挂载点拷进去。
+`config.json` 和 `proxies.txt` 挂的是 `data/panel/` **整目录**(容器内 `panel-data/`),
+不是单文件 —— 单文件 bind mount 在宿主路径缺失时会被 Docker 建成目录,挂目录就没这个坑,
+也让首次 `up` 免去手动 `touch`/`cp`。entrypoint 在目录里建实文件后软链到 `/app/src`。
+`config.json` 目前只被桌面版 `grok_register_ttk.py` 写,Web 面板只读;真要通过面板写它,
+因为现在是目录挂载,`secure_files.atomic_write_text` 的 mkstemp + `os.replace` 也不再跨
+挂载点 EXDEV 失败(临时文件落在同一个 `panel-data/` 目录内)。
+
+> 从旧版单文件挂载升级:把 `data/config.json` → `data/panel/config.json`、
+> `data/proxies.txt` → `data/panel/proxies.txt` 挪进去即可,内容不变。
 
 授权目录用 bind mount 而不是命名卷,这样 grok2api 容器可以直接挂同一个宿主目录读取:
 
@@ -149,9 +153,10 @@ curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/status          
 curl -H "Authorization: Bearer $MONITOR_TOKEN" http://127.0.0.1:8787/api/status # 期望 200
 ```
 
-`smoke.sh` 检查四件容易在改动 entrypoint 后悄悄坏掉的事:`.venv/bin/python` 可执行
+`smoke.sh` 检查几件容易在改动 entrypoint 后悄悄坏掉的事:`.venv/bin/python` 可执行
 (`monitor.py`、`run_until_100.py` 用硬编码路径拉起 worker)、运行时依赖能 import、
-Camoufox 浏览器已下载、`xvfb-run` 和 `/proc` 可用(`process_utils.py` 靠 `/proc` 找进程),
+Camoufox 浏览器已下载、`xvfb-run` 和 `/proc` 可用(`process_utils.py` 靠 `/proc` 找进程)、
+`config.json` 与 `proxies.txt` 已由 entrypoint 创建并软链成常规文件,
 再做一次真实的 `git reset --hard` 确认 `log/` 下的运行数据没被冲掉。
 
 ## 5. CI
@@ -191,6 +196,7 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 | 镜像内装 xvfb + procps | 注册流程走 `xvfb-run`,面板停止进程要读 `/proc` 和 `ps` |
 | 同时出 amd64 和 arm64 | Camoufox 两个架构都有原生 Firefox 构建,ARM 云主机(Ampere、Graviton)能原生跑,不必 QEMU |
 | 授权目录 bind mount,只有 camoufox 缓存用命名卷 | 授权文件是这个面板的产出,要能被 grok2api 读、能直接备份;camoufox 是可重下的缓存,不需要在宿主可见 |
+| `config.json`/`proxies.txt` 挂目录 `panel-data/` 再软链,不直接挂单文件 | 缺失的宿主单文件会被 Docker 建成目录,首次 `up` 就崩;挂目录则由 entrypoint 兜底创建两个文件并软链进 `src/`,新部署无需手动 `touch`/`cp` |
 | 非 root 运行(uid 10001) | 面板会 spawn 子进程、写凭据文件,不该有 root |
 
 ## 7. 安全边界

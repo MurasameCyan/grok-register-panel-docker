@@ -55,24 +55,36 @@ fi
 
 mkdir -p log accounts cpa_auth grok2api_auth
 
-# Docker silently creates a DIRECTORY for a single-file bind mount whose host
-# path does not exist yet. Fail loudly instead of looping on a doomed `cp`.
-for f in config.json proxies.txt; do
-    [ -d "$f" ] || continue
-    echo "$APP_DIR/$f is a directory, not a file. The host path did not exist" >&2
-    echo "when the container first started, so Docker created a directory." >&2
-    echo "Fix on the host: docker compose down && rmdir data/$f" >&2
-    echo "then create it as a real file before the next up. See README step 1." >&2
-    exit 1
-done
-
-[ -f config.json ] || cp config.example.json config.json
+# config.json and proxies.txt are single files, but a single-file bind mount
+# becomes a directory when the host path is missing. Mount a directory
+# ($PANEL_DATA_DIR, default panel-data/) instead and symlink the two files the
+# app reads into it. This is also why a fresh `up` needs no manual touch/cp:
+# the files below are created on first start. config.json and proxies*.txt are
+# gitignored upstream and panel-data/ is untracked, so the `git reset --hard`
+# above touches none of them.
+DATA_DIR="${PANEL_DATA_DIR:-$APP_DIR/panel-data}"
+mkdir -p "$DATA_DIR"
 
 # Bind-mounted dirs keep host ownership. Fail now rather than after a register
 # run has already spent an email address and cannot write the auth file.
-for d in log accounts cpa_auth grok2api_auth; do
-    [ -w "$d" ] || { echo "$APP_DIR/$d is not writable by uid $(id -u); chown -R 10001:10001 the host dir" >&2; exit 1; }
+for d in log accounts cpa_auth grok2api_auth "$DATA_DIR"; do
+    [ -w "$d" ] || { echo "$d is not writable by uid $(id -u); chown -R 10001:10001 the host dir" >&2; exit 1; }
 done
+
+if [ ! -f "$DATA_DIR/config.json" ]; then
+    # Not `[ -f x ] && cp` inside a `||` group: that group is the last element of
+    # the || list, so a missing example would make set -e kill the container with
+    # no message at all.
+    [ -f config.example.json ] || {
+        echo "config.example.json is missing from the upstream checkout;" >&2
+        echo "write $DATA_DIR/config.json on the host by hand and restart" >&2
+        exit 1
+    }
+    cp config.example.json "$DATA_DIR/config.json"
+fi
+[ -f "$DATA_DIR/proxies.txt" ] || : > "$DATA_DIR/proxies.txt"
+ln -sfn "$DATA_DIR/config.json" config.json
+ln -sfn "$DATA_DIR/proxies.txt" proxies.txt
 
 case "${MONITOR_HOST:-}" in
     127.*|localhost|::1) ;;
