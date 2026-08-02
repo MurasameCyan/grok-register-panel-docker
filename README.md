@@ -80,8 +80,19 @@ sudo chown -R 10001:10001 data && docker compose restart panel
 因为现在是目录挂载,`secure_files.atomic_write_text` 的 mkstemp + `os.replace` 也不再跨
 挂载点 EXDEV 失败(临时文件落在同一个 `panel-data/` 目录内)。
 
-> 从旧版单文件挂载升级:把 `data/config.json` → `data/panel/config.json`、
-> `data/proxies.txt` → `data/panel/proxies.txt` 挪进去即可,内容不变。
+> **从旧版单文件挂载升级:**
+>
+> ```bash
+> docker compose down
+> mkdir -p data/panel
+> mv data/config.json data/proxies.txt data/panel/    # 内容不变
+> sudo chown -R 10001:10001 data                      # 整个 data,不只 data/panel
+> docker compose up -d
+> ```
+>
+> 最后那次 `chown` 别漏:旧部署里 `data/log`、`data/accounts`、`data/cpa_auth`、
+> `data/grok2api_auth` 很可能是 Docker 用 root 建的(`0:0`),只 chown 新建的
+> `data/panel` 会让容器卡在上面那个 "not writable" 循环里。
 
 授权目录用 bind mount 而不是命名卷,这样 grok2api 容器可以直接挂同一个宿主目录读取:
 

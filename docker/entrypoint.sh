@@ -86,7 +86,9 @@ if [ -n "$bad" ]; then
     printf '%s' "$bad" >&2
     echo "The host dirs are owned by someone else -- Docker creates a missing" >&2
     echo "bind-mount source as root, so an \`up\` that ran before the chown" >&2
-    echo "leaves them root-owned. Fix on the host, in the compose directory:" >&2
+    echo "leaves them root-owned. Run this on the host, in the compose" >&2
+    echo "directory -- it covers every dir listed above at once, and note it" >&2
+    echo "is the whole data/ tree, not just the dirs named:" >&2
     echo "  sudo chown -R 10001:10001 data && docker compose restart panel" >&2
     exit 1
 fi
