@@ -67,9 +67,29 @@ mkdir -p "$DATA_DIR"
 
 # Bind-mounted dirs keep host ownership. Fail now rather than after a register
 # run has already spent an email address and cannot write the auth file.
-for d in log accounts cpa_auth grok2api_auth "$DATA_DIR"; do
-    [ -w "$d" ] || { echo "$d is not writable by uid $(id -u); chown -R 10001:10001 the host dir" >&2; exit 1; }
+# Report every bad dir in one pass: `up` before the chown usually leaves all of
+# them root-owned, and restart:unless-stopped would otherwise make the user
+# restart once per directory to discover the next name.
+bad=''
+# "container-path host-path" pairs; the loop splits on the space. $DATA_DIR is
+# absolute, the others are relative to $APP_DIR (we cd'd there above).
+for pair in "log data/log" "accounts data/accounts" "cpa_auth data/cpa_auth" \
+            "grok2api_auth data/grok2api_auth" "$DATA_DIR data/panel"; do
+    d="${pair% *}"
+    host="${pair#* }"
+    [ -w "$d" ] && continue
+    bad="$bad  $d (host $host) is owned by $(stat -c '%u:%g' "$d")
+"
 done
+if [ -n "$bad" ]; then
+    echo "These bind mounts are not writable by uid $(id -u):" >&2
+    printf '%s' "$bad" >&2
+    echo "The host dirs are owned by someone else -- Docker creates a missing" >&2
+    echo "bind-mount source as root, so an \`up\` that ran before the chown" >&2
+    echo "leaves them root-owned. Fix on the host, in the compose directory:" >&2
+    echo "  sudo chown -R 10001:10001 data && docker compose restart panel" >&2
+    exit 1
+fi
 
 if [ ! -f "$DATA_DIR/config.json" ]; then
     # Not `[ -f x ] && cp` inside a `||` group: that group is the last element of

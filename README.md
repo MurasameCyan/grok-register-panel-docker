@@ -25,6 +25,22 @@ chmod 600 .env
 docker compose up -d --pull always      # 直接拉 GHCR 镜像,不构建
 ```
 
+**`mkdir` + `chown` 必须在 `up` 之前。** bind mount 的宿主目录不存在时,Docker 会用 root
+把它建出来,容器内 uid 10001 就写不进去。已经踩了的话日志会每隔几秒重复:
+
+```
+These bind mounts are not writable by uid 10001:
+  log (host data/log) is owned by 0:0
+  ...
+```
+
+补一次 `chown` 即可,不用重建容器(`restart: unless-stopped` 会一直重试,所以日志刷屏是
+预期的退避行为,不是二次故障):
+
+```bash
+sudo chown -R 10001:10001 data && docker compose restart panel
+```
+
 没有 `.env` 就 `up` 会直接报
 `required variable MONITOR_TOKEN is missing a value` —— 这是故意的硬失败,不是 bug:
 容器内绑 `0.0.0.0`,没 Token 启动就是个无鉴权面板。
