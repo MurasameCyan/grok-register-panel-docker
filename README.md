@@ -56,6 +56,109 @@ docker compose exec panel vi panel-data/config.json    # 或在面板里改
 docker compose restart panel
 ```
 
+面板里想看到日志原文(默认那张卡片写着 `raw log tail disabled`),在 `.env` 里打开:
+
+```bash
+printf 'PANEL_INCLUDE_TAIL=1\n' >> .env
+docker compose up -d       # 不是 restart:改环境变量要重建容器才生效
+```
+
+### 环境变量
+
+上游代码里能读的环境变量,`docker-compose.yml` 全部列成了 `${VAR:-默认值}`,所以都能在
+`.env` 里覆盖,不必改 compose 文件。`.env.example` 是同一份清单,每行都注在默认值上。
+
+这份清单是从上游源码里的 `os.environ.get` / `os.getenv` / `os.environ[...]` 逐个找出来的,
+不是抄文档 —— 所以它等于代码真正会读的东西。**改任何一个都要 `docker compose up -d`**,
+`restart` 不会重建容器,新值进不去。
+
+面板服务:
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `MONITOR_TOKEN` | *(自动生成)* | 留空则首次启动生成 64 位 hex 存进 `panel-data/monitor_token` |
+| `PANEL_INCLUDE_TAIL` | `0` | `1` 显示日志原文卡片(上游过 `redact_log_line` 脱敏) |
+| `MONITOR_CORS_ORIGIN` | *(空)* | 精确 origin;上游不认 `*`,空即同源 |
+
+`MONITOR_HOST`/`MONITOR_PORT` 固定成 `0.0.0.0:8787`,那是容器内部地址;对外暴露改
+`ports:` 那行,见第 3 节。
+
+注册运行参数:
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `GROK_BATCH_IDLE_TIMEOUT` | `360` | 多少秒没有日志输出就重建 batch 子进程,上游下限 60 |
+| `GROK_BATCH_MAX_RESTARTS` | `8` | 一批里最多自动恢复几次 |
+| `PROXY_NETWORK_COOLDOWN_SECONDS` | `90` | 网络失败冷却,上游下限 10 |
+| `PROXY_RISK_COOLDOWN_SECONDS` | `1800` | 风控冷却,上游下限 60 |
+| `REGISTER_WORKERS` | `2` | **面板启动的运行不看它** —— 只有手动跑 `run_xvfb_smoke.py` 时读 |
+| `ORCH_BASE_CPA` | `0` | 同上,面板写过 `monitor_control.json` 之后就被覆盖 |
+| `ORCH_ADD_COUNT` | `100` | 同上 |
+
+后三个映射出来是为了"上游能读的都能设",但**并发数和目标数量请在面板里改**:面板的"并发数"
+和"再跑 N 个"写进 `log/monitor_control.json`,`run_until_100.py` 的 `apply_control()` 会用它
+覆盖 `ORCH_*`;并发数则从来只走 `monitor_control.json` 的 `workers`,`REGISTER_WORKERS` 在
+这条路径上完全不参与。
+
+浏览器运行时:
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `GROK_USE_XVFB` | `auto` | 只接受 `auto`/`1`/`0`,别的值启动就抛 `RuntimePlatformError`。镜像里有 xvfb 且无 X display,`auto` 会解析成 `xvfb-run` |
+| `GROK_PYTHON_BIN` | *(空)* | 覆盖 worker 用的 `.venv/bin/python`;entrypoint 已把 `.venv` 软链到 `/opt/venv`,一般不用动 |
+
+状态文件路径。这几个都进 `Path()`,**空值会解析成 `.`**,也就是写进 `/app/src` —— 而
+entrypoint 每次启动都 `git reset --hard` 那个目录,写进去的东西会被清掉。所以 compose 给的
+是绝对路径而不是 `${VAR:-}`,你要改也请给挂载目录下的绝对路径:
+
+| 变量 | 默认 |
+| --- | --- |
+| `CPA_AUTH_DIR` | `/app/src/cpa_auth` |
+| `EMAIL_PROVIDER_CONFIG_FILE` | `/app/src/panel-data/config.json` |
+| `PROXY_POOL_STATE_FILE` | `/app/src/log/proxy_pool.json` |
+| `PROXY_POOL_LEGACY_FILE` | `/app/src/panel-data/proxies.txt` |
+| `BLACKLIST_STATE_FILE` | `/app/src/log/blacklist_state.json` |
+| `EMAIL_DOMAIN_POOL_STATE_FILE` | `/app/src/log/email_domain_pool.json` |
+| `BATCH_LOG` | *(空 = 取 `log/` 里最新的 `batch*.log`)* |
+
+`EMAIL_PROVIDER_CONFIG_FILE` 特意指向 `panel-data/` 里的**真实文件**,不是 `/app/src` 里的
+软链:面板存邮箱服务商配置走 `atomic_write_json`,里面的 `os.replace(临时文件, 目标)` 会把
+软链本身替换成普通文件,而下次启动 entrypoint 的 `ln -sfn` 又会把它覆盖掉 —— 刚存的配置就
+没了。写在 `panel-data/` 里同时让 `mkstemp` 和目标同挂载点,不会 EXDEV。
+
+邮箱服务商凭据 —— `CLOUDMAIL_URL`、`CLOUDMAIL_ADMIN_EMAIL`、`CLOUDMAIL_PASSWORD`、
+`MOEMAIL_API_BASE`、`MOEMAIL_API_URL`、`MOEMAIL_API_KEY`,默认全空。`MOEMAIL_API_URL` 是旧
+别名,只在 `MOEMAIL_API_BASE` 为空时才读。
+
+**建议留空,在面板里填。** 上游是 `os.environ.get(X) or config.get(x)` —— 环境变量优先级
+高于 `config.json`,所以这里一旦设了值,你在面板里改同一项会像是"改了没反应"(存进
+`config.json` 了,但读的时候还是环境变量赢)。另外写在这里的密码会进 `docker inspect` 输出
+和执行 compose 那个人的 shell 历史。
+
+出站代理 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` 默认空,**但它们不会给注册
+走代理**:
+`run_batch_headless._run_child` 在 import 上游模块之前就把 `http_proxy`/`https_proxy`/
+`ALL_PROXY`(大小写都算)从环境里 pop 掉了,worker 一律从干净环境起,代理只认 `config.json`
+的 `proxy` 和面板的代理池 —— 要给注册配代理请填那两处。这三个变量实际生效的地方是
+entrypoint 自己的 `git`/`pip`,以及账号恢复(`recovery_ops` 起的 `sso_to_auth_json.py`,它
+继承 `os.environ`,`config.json` 没设 proxy 时 urllib 会认环境变量)。另外有些调用点故意用
+`ProxyHandler({})` / `trust_env = False` 绕开代理 —— geo 查询和连通性探测必须直连。
+
+镜像自己的开关(上游不读):`UPSTREAM_REF`(默认 `main`)、`UPSTREAM_AUTO_UPDATE`
+(`1`)、`AUTO_PIP_INSTALL`(`1`,`0` 跳过装上游新依赖)、`PANEL_FIX_OWNERSHIP`(`1`)、
+`IMAGE_TAG`(`latest`)、`TZ`(`Asia/Shanghai`)。
+
+故意没有映射出来的:`DISPLAY` / `WAYLAND_DISPLAY` 和 `GROK_BATCH_PROGRESS_FILE` 由
+`xvfb-run` 和 `batch_supervisor` 按子进程设(而且在这里设 `DISPLAY` 会让
+`GROK_USE_XVFB=auto` 误判成"有真实显示");`LOCALAPPDATA` / `DPE_REEXEC_DONE` /
+`TK_SILENCE_DEPRECATION` 只对桌面版 Tk 有意义;`GITHUB_TOKEN` / `GH_TOKEN` /
+`GITHUB_REPOSITORY` 是上游自己 CI 脚本用的;`PANEL_DATA_DIR` 则是因为 compose 的卷正好挂在
+那个路径上,从 `.env` 改它只会把 `config.json` 写到挂载点外面去。
+
+对账方式:上游树里(排除 `tests/`)一共 30 个被读取的环境变量,除上面这几个之外全部映射了。
+`GROK_REGISTER_THEME` / `_APP_VIEW` / `_HELP_TAB` 看着像变量,其实是前端 localStorage 的
+key,不是环境变量。
+
 ### 想让数据直接落在宿主目录
 
 默认用命名卷是为了"拉了就能跑"。要把授权文件和日志放到宿主上(方便给 grok2api 挂、方便
@@ -330,6 +433,13 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 `127.0.0.1`,不是公网可达。要对外暴露,放到带 TLS 和额外身份认证的反向代理后面,
 并保持 `PANEL_INCLUDE_TAIL=0`。`MONITOR_TOKEN` 是唯一的鉴权凭据,别写进 URL、
 命令行参数或仓库。
+
+**日志尾部默认关闭,是可以打开的。** 面板"日志尾部"卡片显示
+`(raw log tail disabled; set PANEL_INCLUDE_TAIL=1)` 时,在 `.env` 里写
+`PANEL_INCLUDE_TAIL=1` 再 `docker compose up -d`(`restart` 不够 —— 改环境变量要重建容器)。
+它是面板里唯一逐行回显日志原文的地方,所以默认关;上游每行都过 `redact_log_line`,会盖掉
+邮箱、JWT、代理 URL 和 `token=`/`password=` 这类键值,但那是兜底,不是理由。面板本身暴露在
+公网时保持 `0`。
 
 **自动生成的 Token 是真鉴权,不是占位。** 32 字节 `/dev/urandom` 转 hex,`0600` 存在
 `panel-data/monitor_token`(命名卷或 `data/panel/`,不入库)。要点在于上游

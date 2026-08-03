@@ -9,15 +9,119 @@ services:
     init: true
     # Camoufox/Firefox crashes on the default 64 MB /dev/shm.
     shm_size: 1gb
+    # Every upstream-readable env var is listed here, each overridable from .env.
+    # Enumerated from the upstream tree (os.environ.get / os.getenv / os.environ[])
+    # rather than from its docs, so the list is what the code actually reads.
+    # Deliberately NOT exposed: DISPLAY / WAYLAND_DISPLAY and
+    # GROK_BATCH_PROGRESS_FILE (set per child process by xvfb-run and
+    # batch_supervisor -- and setting DISPLAY here would make GROK_USE_XVFB=auto
+    # think a real display exists), LOCALAPPDATA / DPE_REEXEC_DONE /
+    # TK_SILENCE_DEPRECATION (desktop-Tk only), and GITHUB_TOKEN / GH_TOKEN /
+    # GITHUB_REPOSITORY (upstream's own CI scripts).
+    # PANEL_DATA_DIR is left out too: the volume below mounts that exact path,
+    # so moving it from .env would put config.json outside the mount, and the
+    # path defaults further down would still point at panel-data/.
     environment:
+      # --- panel HTTP server ---
       MONITOR_HOST: 0.0.0.0        # container-internal; publish only to 127.0.0.1 below
       MONITOR_PORT: 8787
-      # Optional: unset means the entrypoint generates one on first start and
-      # saves it to panel-data/monitor_token. Set it in .env to pin your own.
+      # Unset means the entrypoint generates one on first start and saves it to
+      # panel-data/monitor_token. Set it in .env to pin your own.
       MONITOR_TOKEN: ${MONITOR_TOKEN:-}
-      PANEL_INCLUDE_TAIL: 0
+      # 1 shows the raw log tail in the panel's "日志尾部" card. Off by default
+      # because the tail is the one panel field that echoes log lines verbatim;
+      # upstream runs each through redact_log_line() (emails, JWTs, proxy URLs,
+      # token-ish key=value pairs), so this is defence in depth, not the only
+      # guard. Set PANEL_INCLUDE_TAIL=1 in .env to turn it on.
+      PANEL_INCLUDE_TAIL: ${PANEL_INCLUDE_TAIL:-0}
+      # Exact origin for Access-Control-Allow-Origin. Upstream ignores "*", so
+      # empty (same-origin only) is both the default and the safe value.
+      MONITOR_CORS_ORIGIN: ${MONITOR_CORS_ORIGIN:-}
+
+      # --- register run sizing ---
+      # Both floored upstream (60 and 0).
+      GROK_BATCH_IDLE_TIMEOUT: ${GROK_BATCH_IDLE_TIMEOUT:-360}
+      GROK_BATCH_MAX_RESTARTS: ${GROK_BATCH_MAX_RESTARTS:-8}
+      # Proxy cooldowns; upstream floors these at 10 and 60 seconds.
+      PROXY_NETWORK_COOLDOWN_SECONDS: ${PROXY_NETWORK_COOLDOWN_SECONDS:-90}
+      PROXY_RISK_COOLDOWN_SECONDS: ${PROXY_RISK_COOLDOWN_SECONDS:-1800}
+      # Upstream reads these three, but NOT on the path the panel starts: it
+      # writes workers/add_count into log/monitor_control.json, and
+      # run_until_100.apply_control() overrides ORCH_* from there while
+      # concurrency only ever comes from control["workers"]. REGISTER_WORKERS is
+      # read by run_xvfb_smoke.py alone. Listed for completeness; change
+      # concurrency and target count in the panel UI instead.
+      REGISTER_WORKERS: ${REGISTER_WORKERS:-2}
+      ORCH_BASE_CPA: ${ORCH_BASE_CPA:-0}
+      ORCH_ADD_COUNT: ${ORCH_ADD_COUNT:-100}
+
+      # --- browser runtime ---
+      # auto|1|0 only; anything else raises RuntimePlatformError at startup.
+      # The image has xvfb and no X display, so auto resolves to xvfb-run.
+      GROK_USE_XVFB: ${GROK_USE_XVFB:-auto}
+      # Overrides the hardcoded ROOT/.venv/bin/python for spawned workers. The
+      # entrypoint symlinks .venv -> /opt/venv, so leave this empty.
+      GROK_PYTHON_BIN: ${GROK_PYTHON_BIN:-}
+
+      # --- state file paths (defaults keep everything inside the volumes) ---
+      # Each of these is fed to Path(); an empty value would resolve to "." and
+      # write into /app/src, which git reset --hard then wipes. So they carry
+      # real defaults rather than ${VAR:-}.
+      #
+      # config.json names the REAL file in panel-data/, not the /app/src
+      # symlink: email_provider_store saves via atomic_write_json, whose
+      # os.replace(temp, target) would replace the symlink with a regular file
+      # in /app/src -- and the entrypoint's `ln -sfn` would then throw that file
+      # away on the next start, losing whatever the panel just saved. Writing
+      # into panel-data/ directly also keeps mkstemp on the same mount, so no
+      # EXDEV. The hardcoded panel-data matches the entrypoint's own default,
+      # which is safe because PANEL_DATA_DIR is deliberately not exposed above.
+      CPA_AUTH_DIR: ${CPA_AUTH_DIR:-/app/src/cpa_auth}
+      EMAIL_PROVIDER_CONFIG_FILE: ${EMAIL_PROVIDER_CONFIG_FILE:-/app/src/panel-data/config.json}
+      PROXY_POOL_STATE_FILE: ${PROXY_POOL_STATE_FILE:-/app/src/log/proxy_pool.json}
+      # Read-only in upstream (proxy_store only ever reads the legacy file), so
+      # the symlink would work here too; kept parallel to config.json anyway.
+      PROXY_POOL_LEGACY_FILE: ${PROXY_POOL_LEGACY_FILE:-/app/src/panel-data/proxies.txt}
+      BLACKLIST_STATE_FILE: ${BLACKLIST_STATE_FILE:-/app/src/log/blacklist_state.json}
+      EMAIL_DOMAIN_POOL_STATE_FILE: ${EMAIL_DOMAIN_POOL_STATE_FILE:-/app/src/log/email_domain_pool.json}
+      # Pins which log file the panel tails; empty means newest log/batch*.log.
+      BATCH_LOG: ${BATCH_LOG:-}
+
+      # --- email provider credentials ---
+      # Optional, and they WIN over config.json: upstream reads
+      # `os.environ.get(X) or config.get(x)`, so a value set here silently
+      # overrides what the panel UI saves, and editing it in the UI then appears
+      # to do nothing. Prefer leaving these empty and using the UI /
+      # config.json; anything set here also lands in `docker inspect` and in the
+      # shell history of whoever ran compose.
+      CLOUDMAIL_URL: ${CLOUDMAIL_URL:-}
+      CLOUDMAIL_ADMIN_EMAIL: ${CLOUDMAIL_ADMIN_EMAIL:-}
+      CLOUDMAIL_PASSWORD: ${CLOUDMAIL_PASSWORD:-}
+      MOEMAIL_API_BASE: ${MOEMAIL_API_BASE:-}
+      MOEMAIL_API_URL: ${MOEMAIL_API_URL:-}      # legacy alias, checked after MOEMAIL_API_BASE
+      MOEMAIL_API_KEY: ${MOEMAIL_API_KEY:-}
+
+      # --- outbound proxy ---
+      # These do NOT proxy registration. run_batch_headless._run_child pops
+      # http_proxy/https_proxy/ALL_PROXY (both cases) before importing the app,
+      # so the registration workers always start from a clean environment and
+      # take their proxy from config.json "proxy" / the proxy pool instead --
+      # set it there. What is left for these: the entrypoint's own git/pip, and
+      # the account-recovery run (sso_to_auth_json.py via recovery_ops), which
+      # inherits os.environ and whose urllib path honours them when
+      # config.json has no proxy. Several call sites also bypass proxies on
+      # purpose (ProxyHandler({}) / trust_env = False) for geo and connectivity
+      # probes, which must go direct.
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      ALL_PROXY: ${ALL_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+
+      # --- this image's own knobs (not read by upstream) ---
       UPSTREAM_REF: ${UPSTREAM_REF:-main}
       UPSTREAM_AUTO_UPDATE: ${UPSTREAM_AUTO_UPDATE:-1}
+      AUTO_PIP_INSTALL: ${AUTO_PIP_INSTALL:-1}
+      PANEL_FIX_OWNERSHIP: ${PANEL_FIX_OWNERSHIP:-1}
       TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "127.0.0.1:8787:8787"

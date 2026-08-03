@@ -257,6 +257,65 @@ jobs:
             || { echo "token changed across recreate: $token -> $again" >&2; exit 1; }
           echo "token survived down/up"
 
+          # Every ${VAR:-default} in compose must actually reach the process, and
+          # the state-file paths must land inside a mounted directory. An empty
+          # value would resolve to "." -- i.e. /app/src, which the entrypoint's
+          # `git reset --hard` wipes -- so a typo'd default silently loses data.
+          echo "--- state paths resolve inside the mounts ---"
+          for pair in \
+            "CPA_AUTH_DIR /app/src/cpa_auth" \
+            "EMAIL_PROVIDER_CONFIG_FILE /app/src/panel-data/config.json" \
+            "PROXY_POOL_STATE_FILE /app/src/log/proxy_pool.json" \
+            "PROXY_POOL_LEGACY_FILE /app/src/panel-data/proxies.txt" \
+            "BLACKLIST_STATE_FILE /app/src/log/blacklist_state.json" \
+            "EMAIL_DOMAIN_POOL_STATE_FILE /app/src/log/email_domain_pool.json" \
+            "GROK_USE_XVFB auto"; do
+            var="${pair%% *}"; want="${pair##* }"
+            got="$(docker compose exec -T panel printenv "$var" | tr -d '\r\n')"
+            [ "$got" = "$want" ] \
+              || { echo "$var is '$got', want '$want'" >&2; exit 1; }
+          done
+          echo "all state paths match their compose defaults"
+
+          # Upstream resolves these at import time, so ask upstream itself
+          # instead of trusting that the env var and the module agree. This is
+          # one logical Python line: a heredoc or a real multi-line -c string
+          # would have to start at column 0, which breaks out of this YAML block
+          # scalar, and indenting it instead gives Python an IndentationError.
+          # Backslash-newline inside double quotes is removed by the shell, so
+          # the semicolon-joined form survives both layers intact.
+          echo "--- upstream agrees the paths are inside the mounts ---"
+          docker compose exec -T panel /opt/venv/bin/python -c \
+            "import sys, pathlib; sys.path.insert(0, '/app/src'); \
+             from webui import blacklist_store as b, email_provider_store as e, proxy_store as p; \
+             paths = {'blacklist': b.STATE_PATH, 'config': e.CONFIG_PATH, \
+                      'proxy_pool': p.STATE_PATH, 'proxy_legacy': p.LEGACY_PATH}; \
+             [print('  %-13s %s' % kv) for kv in paths.items()]; \
+             bad = {k: str(v) for k, v in paths.items() \
+                    if not str(pathlib.Path(v).resolve()).startswith(('/app/src/panel-data', '/app/src/log'))}; \
+             sys.exit('resolved outside the mounts: %r' % bad) if bad else None; \
+             sys.exit('config path is a symlink; panel saves would be lost') \
+                 if pathlib.Path(e.CONFIG_PATH).is_symlink() else None; \
+             print('  every state path resolves inside a mount')"
+
+          # PANEL_INCLUDE_TAIL must be reachable from .env -- it was hardcoded
+          # in compose once, so setting it in .env did nothing at all.
+          echo "--- an .env override reaches the panel ---"
+          printf 'PANEL_INCLUDE_TAIL=1\n' > .env
+          IMAGE_TAG="reqs-${{ needs.probe.outputs.reqs_sha }}" \
+            docker compose up -d --wait --wait-timeout 180
+          got="$(docker compose exec -T panel printenv PANEL_INCLUDE_TAIL | tr -d '\r\n')"
+          [ "$got" = 1 ] || { echo ".env PANEL_INCLUDE_TAIL=1 arrived as '$got'" >&2; exit 1; }
+          body="$(docker compose exec -T panel curl -sf \
+                    -H "Authorization: Bearer $token" \
+                    http://127.0.0.1:8787/api/status)"
+          # `if`, not `grep ... && { exit 1; }` -- see the note above.
+          if printf '%s' "$body" | grep -q 'raw log tail disabled'; then
+            echo "tail still disabled with PANEL_INCLUDE_TAIL=1" >&2; exit 1
+          fi
+          echo "the tail card is enabled from .env alone"
+          rm -f .env
+
           docker compose down -v
           cd - >/dev/null
           rm -rf "$fresh"
