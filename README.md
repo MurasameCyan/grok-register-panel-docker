@@ -49,10 +49,16 @@ docker compose up -d
 > `security_utils.py` 全部走 `os.environ.get`,容器里没人会去读 `.env`。挂进去只会多暴露
 > 一份 Token。
 
-起来之后按需编辑配置(邮箱服务商见上游 `DEPLOYMENT.md` 第 2 节),再 `restart`:
+起来之后按需编辑配置(邮箱服务商见上游 `DEPLOYMENT.md` 第 2 节)。**优先在面板里改** ——
+邮箱服务商那一栏面板会直接写 `config.json`(`/api/email-provider`),即时生效,不用 restart。
+
+要在命令行直接改也行,但**镜像里没有编辑器**(`python:3.12-slim` 基础镜像不带 `vi`/`nano`)。
+拷出来改完再拷回去,然后 restart:
 
 ```bash
-docker compose exec panel vi panel-data/config.json    # 或在面板里改
+docker compose cp panel:/app/src/panel-data/config.json ./config.json
+# 用宿主上你惯用的编辑器改 ./config.json
+docker compose cp ./config.json panel:/app/src/panel-data/config.json
 docker compose restart panel
 ```
 
@@ -206,9 +212,12 @@ docker compose exec -T panel tar cf - panel-data cpa_auth grok2api_auth accounts
 
 `config.json` 和 `proxies.txt` 放在 `panel-data/` **目录**里再软链进 `/app/src`,不是各挂
 一个单文件 —— 单文件 bind mount 在宿主路径缺失时会被 Docker 建成目录,挂目录就没这个坑,
-也让首次 `up` 免去手动 `touch`/`cp`。`config.json` 目前只被桌面版 `grok_register_ttk.py`
-写,Web 面板只读;真要通过面板写它,因为现在是目录挂载,`secure_files.atomic_write_text`
-的 mkstemp + `os.replace` 也不再跨挂载点 EXDEV 失败(临时文件落在同一个目录内)。
+也让首次 `up` 免去手动 `touch`/`cp`。Web 面板存邮箱服务商配置(`/api/email-provider` →
+`save_email_provider_config`)会写 `config.json`,走 `secure_files.atomic_write_json`
+(mkstemp + `os.replace`)—— 因为现在是目录挂载,临时文件落在同一个目录内,不再跨挂载点
+EXDEV 失败。这也是 `EMAIL_PROVIDER_CONFIG_FILE` 必须指向 `panel-data/` 里的真实文件、而不是
+`/app/src` 软链的原因(见上面环境变量一节):`os.replace` 会把软链替换成普通文件,下次启动的
+`ln -sfn` 再把它覆盖,刚存的配置就没了。
 
 > **从旧版升级:`docker-compose.yml` 也要一起换。**
 >
