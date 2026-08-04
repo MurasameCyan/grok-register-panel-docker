@@ -12,6 +12,13 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
     || fail "runtime deps missing from venv"
 camoufox version >/dev/null || fail "camoufox browser not fetched"
 command -v xvfb-run >/dev/null || fail "xvfb-run missing (run_batch_headless would die)"
+# Actually spin up an Xvfb display rather than just checking the binary exists:
+# xvfb-run shells out to `xauth` to build its X-authority cookie, and without it
+# every batch dies with "xvfb-run: error: xauth command not found" before a
+# browser ever starts -- a `command -v xvfb-run` check would sail right past
+# that. Running it for real catches xauth and any other missing runtime dep.
+xvfb-run -a -s '-screen 0 640x480x8' true \
+    || fail "xvfb-run cannot start a display (missing xauth, or Xvfb itself broken)"
 [ -r /proc/1/cmdline ] || fail "/proc unreadable (process_utils cannot find workers)"
 
 for d in log accounts cpa_auth grok2api_auth; do

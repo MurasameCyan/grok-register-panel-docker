@@ -23,8 +23,12 @@ ENV PYTHONUNBUFFERED=1 \
 # gosu: the entrypoint starts as root only to chown the bind mounts, then execs
 # itself as uid 10001. Docker creates missing bind-mount sources as root:root,
 # so without this every fresh `up` needs a manual host-side chown first.
+# xauth: xvfb-run builds an X authority cookie via `xauth` and dies with
+# "xauth command not found" without it. --no-install-recommends keeps it out of
+# the xvfb package's deps, so it has to be named explicitly -- registration runs
+# through xvfb-run, so a missing xauth breaks every batch.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git ca-certificates tini xvfb procps curl gosu \
+        git ca-certificates tini xvfb xauth procps curl gosu \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 10001 app
