@@ -4,9 +4,14 @@
 的容器打包。镜像由 GitHub Actions 构建并推送到 GHCR,**本地只拉取,不构建**。
 
 思路:**依赖烘进镜像,源码在容器启动时从上游 git 拉取**。上游是纯 Python,没有编译步骤,
-所以日常代码更新只要 `restart`,不用换镜像;只有 `requirements.txt` 变动才需要新镜像。
-CI 也按这个规则判断:定时任务比对上游 `requirements.txt` 的 sha256 和已发布镜像的 label,
-依赖没变就不构建。
+所以**上游**的日常代码更新只要 `restart`,不用换镜像;上游只有 `requirements.txt` 变动才需要
+新镜像。CI 也按这个规则判断:定时任务比对上游 `requirements.txt` 的 sha256 和已发布镜像的
+label,依赖没变就不构建。
+
+会动的有两样,而且各动各的:上游源码,和**本仓库的镜像**(它装着全部运行期依赖 —— xvfb、
+xauth、camoufox、venv)。本仓库改 `Dockerfile` 时上游可以一行没动,这时 `restart` 没有任何用
+—— 它从不重新拉镜像。要 `docker compose pull && docker compose up -d`。`docker/check-update.sh`
+两边都查,不确定就问它。
 
 镜像:`ghcr.io/murasamecyan/grok-register-panel-docker:latest`
 
@@ -300,6 +305,10 @@ docker compose restart panel        # 日志打印 [upstream] abc1234 -> def5678
 `reset` 半路失败(磁盘满、权限、fetch 断)时哈希文件已经更新了,下次启动会误判"已是最新"
 并从此不再自愈。同一份状态存两处就一定有对不上的那天。
 
+**`restart` 只跟随上游源码,不换镜像。** 本仓库的镜像动了(加运行期依赖、改 entrypoint)时,
+`restart` 会一直跑在旧镜像上,症状是明明修好了却还报同一个错 —— 比如注册批次报
+`xvfb-run: error: xauth command not found`。那种情况要 `pull`,见下。
+
 不确定该 restart 还是 pull:
 
 ```bash
@@ -307,11 +316,18 @@ docker/check-update.sh
 #   up to date at abc1234                     → 退出码 0,什么都不用做
 #   source-only change -> restart is enough   → 退出码 11
 #   requirements.txt changed -> pull          → 退出码 10
+#   image moved: 442daa6 -> 7c1e0b3           → 退出码 10,本仓库镜像动了
 ```
 
-它查 GitHub API 比对 commit hash,再看两个 revision 之间 `requirements.txt` 有没有动 ——
-源码变动不需要新镜像(启动时 git pull 就够),只有依赖变动才要拉镜像。退出码可以直接用在
-cron 里。
+它查两件事。**镜像**:比对容器当前镜像的 digest 和它那个 tag 现在指向的 digest(`latest` 是原地
+重建的,所以只能比 digest,比 tag 名没用)。**上游**:查 GitHub API 比对 commit hash,再看两个
+revision 之间 `requirements.txt` 有没有动 —— 上游源码变动不需要新镜像(启动时 git pull 就够)。
+镜像先查:镜像要换的话,新容器启动时会把源码一起同步上来,上游那边说什么都不影响结论。
+退出码可以直接用在 cron 里。
+
+本地构建的镜像、digest 固定的 ref、非 GHCR 的 registry,镜像这半边查不了,会**跳过**而不是瞎报
+"该 pull" —— cron 里每次都误报比不报更糟。上游那半边照常工作。自检 ref 拆分:
+`docker/check-update.sh --self-check`(不需要 docker,也不联网)。
 
 `docker compose pull` 时顺手把 compose 文件也拉一次,它和镜像是配套的(挂载布局变过一次,
 只换镜像会起不来):
@@ -421,7 +437,7 @@ echo <你的PAT> | docker login ghcr.io -u MurasameCyan --password-stdin
 
 | 决定 | 原因 |
 | --- | --- |
-| 镜像只装依赖,源码启动时 git pull | 上游是纯 Python 无编译步骤;源码天天变、依赖很少变,分开后日常更新只要 `restart`,CI 也只在依赖变动时才构建 |
+| 镜像只装依赖,源码启动时 git pull | 上游是纯 Python 无编译步骤;源码天天变、依赖很少变,分开后跟随上游只要 `restart`,CI 也只在依赖变动时才构建。代价是"该 restart 还是 pull"要靠 `check-update.sh` 回答,而它必须同时查上游和本仓库镜像两边 —— 只查上游的话,本仓库加个运行期依赖就会让人一直 `restart` 在旧镜像上 |
 | `.env` 不挂进容器 | 上游无 dotenv 依赖,全走 `os.environ`;compose 在宿主读它并注入环境变量,挂进去只多暴露一份 Token |
 | venv 放 `/opt/venv`,启动时软链到 `src/.venv` | `git reset --hard` 永远碰不到依赖;而上游硬编码 `ROOT/.venv/bin/python`,软链是唯一不改上游代码的解法 |
 | 源码保留 `.git`,启动时 `ls-remote` 比 hash,不同才 reset | 跟随上游只需重启;不额外存哈希文件是因为 git 自己就存着 revision,存两处会在 reset 半失败时永久误判"已最新" |

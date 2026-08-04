@@ -257,6 +257,32 @@ jobs:
             || { echo "token changed across recreate: $token -> $again" >&2; exit 1; }
           echo "token survived down/up"
 
+          # check-update.sh must not cry "pull" at a container that is already on
+          # the image we just pushed. Its ref-splitting is the part that would
+          # silently query the wrong repo, so run its self-check too.
+          echo "--- check-update.sh does not false-positive on a fresh image ---"
+          "$GITHUB_WORKSPACE/docker/check-update.sh" --self-check
+          rc=0
+          # IMAGE_TAG must be passed: compose resolves ${IMAGE_TAG:-latest} when
+          # reading the file, so without it the script would ask the registry
+          # about `latest` while the stack is actually running reqs-<sha>.
+          GITHUB_TOKEN=${{ github.token }} \
+          IMAGE_TAG="reqs-${{ needs.probe.outputs.reqs_sha }}" \
+            "$GITHUB_WORKSPACE/docker/check-update.sh" > /tmp/cu.log 2>&1 || rc=$?
+          cat /tmp/cu.log
+          # Only the image half is asserted. The upstream half may legitimately
+          # say "pull" if upstream lands a requirements.txt change between this
+          # build and this check -- a real race, and not this script's bug.
+          if grep -q 'image moved' /tmp/cu.log; then
+            echo "reported a stale image right after pulling it" >&2; exit 1
+          fi
+          # 0 up-to-date, 10 pull, 11 restart. 2 is a hard error (missing dep,
+          # container unreachable, unparseable API response) and must not pass.
+          case "$rc" in
+            0|10|11) echo "check-update.sh exited $rc" ;;
+            *) echo "check-update.sh failed with $rc" >&2; exit 1 ;;
+          esac
+
           # Every ${VAR:-default} in compose must actually reach the process, and
           # the state-file paths must land inside a mounted directory. An empty
           # value would resolve to "." -- i.e. /app/src, which the entrypoint's
