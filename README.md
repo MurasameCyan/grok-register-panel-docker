@@ -243,14 +243,37 @@ EXDEV 失败。这也是 `EMAIL_PROVIDER_CONFIG_FILE` 必须指向 `panel-data/`
 > docker compose up -d
 > ```
 >
-> 数据在 `./data/` 里、想继续留在宿主上,则再取一份 bind 覆盖文件,并把两个文件挪进
-> `data/panel/`:
+> 数据在 `./data/` 里、想继续留在宿主上,则再取一份 bind 覆盖文件,并把那两个搬进
+> `data/panel/`。**搬之前先看清它们是文件还是目录** —— 这决定了要 `mv` 还是要删:
 >
 > ```bash
 > docker compose down
 > curl -fsSLO https://raw.githubusercontent.com/MurasameCyan/grok-register-panel-docker/main/docker-compose.yml
 > curl -fsSLO https://raw.githubusercontent.com/MurasameCyan/grok-register-panel-docker/main/docker-compose.bind.yml
-> mkdir -p data/panel && mv data/config.json data/proxies.txt data/panel/   # 若还是旧布局
+> mkdir -p data/panel
+> ls -ld data/config.json data/proxies.txt      # d 开头 = 目录,- 开头 = 文件
+> ```
+>
+> **是文件**(旧部署正常跑过,里面是你的真配置)—— 搬进去:
+>
+> ```bash
+> mv data/config.json data/proxies.txt data/panel/
+> ```
+>
+> **是目录**(Docker 建的空壳,也正是报错的原因)—— 删掉,别搬。`mv` 一个目录进
+> `data/panel/` 只会得到 `data/panel/config.json/`,还是目录,下次启动报同一个错:
+>
+> ```bash
+> sudo rmdir data/config.json data/proxies.txt
+> ```
+>
+> `rmdir` 只删空目录,非空就拒绝 —— 所以它不会吃掉你的数据。真删不掉说明里面有东西,先
+> `ls -a` 看一眼再决定。删掉后 entrypoint 会在 `data/panel/` 里重新生成 `config.json`
+> (从上游 `config.example.json` 拷),**面板里的邮箱服务商配置要重填一次**。
+>
+> 然后起:
+>
+> ```bash
 > docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d
 > ```
 >

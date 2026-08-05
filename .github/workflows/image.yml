@@ -212,6 +212,13 @@ jobs:
           fi
           grep -q 'docker-compose.yml predates this image' /tmp/legacy.log \
             || { echo "did not identify the stale compose file" >&2; exit 1; }
+          # Both mounts above are DIRECTORIES, so the bind-layout advice must say
+          # rmdir. It used to say "move data/config.json into data/panel/", which
+          # is self-defeating for the only shape that triggers this message: mv
+          # lands the directory at data/panel/config.json/, still a directory, and
+          # the next start prints this same error. That loop is what shipped.
+          grep -q 'rmdir' /tmp/legacy.log \
+            || { echo "directory-shape advice does not mention rmdir" >&2; exit 1; }
           # `if`, not `grep ... && { exit 1; }`: a non-match is the PASS case here,
           # and as the last element of an && list its exit 1 would trip set -e.
           if grep -q 'failed to create symbolic link' /tmp/legacy.log; then

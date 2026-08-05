@@ -43,8 +43,14 @@ if [ -n "$stale" ]; then
     echo "  curl -fsSLO https://raw.githubusercontent.com/MurasameCyan/grok-register-panel-docker/main/docker-compose.yml" >&2
     echo "  docker compose up -d" >&2
     echo "To keep data on the host instead of in named volumes, also fetch" >&2
-    echo "docker-compose.bind.yml, move data/config.json and data/proxies.txt into" >&2
-    echo "data/panel/, and add -f docker-compose.bind.yml to both commands." >&2
+    echo "docker-compose.bind.yml, add -f docker-compose.bind.yml to both commands," >&2
+    echo "and deal with the two host paths according to the shape listed above:" >&2
+    echo "  a DIRECTORY is an empty shell Docker created -- delete it, do not move" >&2
+    echo "  it. \`mv\` puts it at data/panel/config.json/, still a directory, and you" >&2
+    echo "  land right back here:  sudo rmdir data/config.json data/proxies.txt" >&2
+    echo "  (rmdir refuses a non-empty dir, so it cannot eat data. config.json is" >&2
+    echo "  then re-seeded and the panel's email-provider settings need re-entering.)" >&2
+    echo "  a real FILE is your data -- move it:  mv data/config.json data/panel/" >&2
     exit 1
 fi
 
