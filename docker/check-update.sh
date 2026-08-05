@@ -84,8 +84,28 @@ api "$API/commits/$REF" > "$tmp/head.json"
 remote_rev="$(field "$tmp/head.json" sha)"
 [ -n "$remote_rev" ] || { echo "could not resolve $SLUG@$REF" >&2; exit 2; }
 
-local_rev="$(docker compose exec -T "$SERVICE" git rev-parse HEAD 2>/dev/null || true)"
-[ -n "$local_rev" ] || { echo "container '$SERVICE' not running; start it first" >&2; exit 2; }
+# safe.directory: the image has no `USER app` (the entrypoint needs root to chown
+# the mounts, then gosu-execs itself as uid 10001), so `exec` lands as ROOT while
+# the checkout is owned by 10001 -- and git's dubious-ownership guard exits 128
+# with an empty stdout. Every other exec in this repo is uid-agnostic, which is
+# why only this one broke. Overriding the guard beats passing `-u 10001`, which
+# would itself break the `user: "1000:1000"` opt-out the Dockerfile documents:
+# this way the call works whoever owns the checkout and whoever we land as.
+#
+# stderr goes to a file rather than /dev/null: swallowing it turned every real
+# failure into "container not running", which sent people to restart a container
+# that was already up. Ask git for nothing but the revision, and show whatever it
+# says when that comes back empty.
+local_rev="$(docker compose exec -T "$SERVICE" \
+                 git -c safe.directory='*' rev-parse HEAD \
+                 2>"$tmp/git.err" | tr -d '\r' || true)"
+if [ -z "$local_rev" ]; then
+    echo "could not read the checked-out revision from container '$SERVICE':" >&2
+    sed 's/^/  /' "$tmp/git.err" >&2
+    echo "if the container is up, this is not a 'start it first' problem -- the" >&2
+    echo "exec itself failed. \`docker compose ps\` and \`logs $SERVICE\` say which." >&2
+    exit 2
+fi
 
 short() { printf '%.7s' "$1"; }
 
